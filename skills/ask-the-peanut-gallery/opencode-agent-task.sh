@@ -135,7 +135,7 @@ if command -v jq >/dev/null; then
           pid: ($pid | tonumber),
           pgid: (if $pgid == "" then null else ($pgid | tonumber) end),
           supervisor_pid: (if $supervisor_pid == "" then null else ($supervisor_pid | tonumber) end),
-          agent: ($agent | select(. != ""))}' \
+          agent: (if $agent == "" then null else $agent end)}' \
         > "$meta_file"
 fi
 
