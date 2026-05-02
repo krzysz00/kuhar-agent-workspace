@@ -140,6 +140,7 @@ mkdir -p "$task_dir"
 
 meta_file="$task_dir/meta.json"
 start_time="$(date -Iseconds)"
+pgid="$(ps -o pgid= -p "$$" | tr -d ' ' || true)"
 
 jq -n \
     --arg model "$model" \
@@ -147,7 +148,14 @@ jq -n \
     --arg prompt "$prompt" \
     --arg start "$start_time" \
     --arg timeout "$timeout_secs" \
-    '{model: $model, workspace: $workspace, prompt: $prompt, start: $start, timeout: ($timeout | tonumber)}' \
+    --arg pid "$$" \
+    --arg pgid "$pgid" \
+    --arg supervisor_pid "${PEANUT_SUPERVISOR_PID:-}" \
+    '{runner: "cursor", model: $model, workspace: $workspace, prompt: $prompt,
+      start: $start, timeout: ($timeout | tonumber),
+      pid: ($pid | tonumber),
+      pgid: (if $pgid == "" then null else ($pgid | tonumber) end),
+      supervisor_pid: (if $supervisor_pid == "" then null else ($supervisor_pid | tonumber) end)}' \
     > "$meta_file"
 
 # --- Run the agent ---
@@ -159,8 +167,7 @@ echo "  Output:    $output_file" >&2
 echo "  Timeout:   ${timeout_secs}s" >&2
 echo "" >&2
 
-rc=0
-timeout "$timeout_secs" cursor-agent --print \
+exec cursor-agent --print \
     --model "$model" \
     --force \
     --trust \
@@ -168,19 +175,4 @@ timeout "$timeout_secs" cursor-agent --print \
     --output-format text \
     --workspace "$workspace" \
     "$prompt" \
-    > "$output_file" || rc=$?
-
-end_time="$(date -Iseconds)"
-jq --arg end "$end_time" --argjson rc "$rc" '.end = $end | .exit_code = $rc' "$meta_file" > "$meta_file.tmp" \
-    && mv "$meta_file.tmp" "$meta_file"
-
-echo "" >&2
-if [[ "$rc" -ne 0 ]]; then
-    echo "Agent exited with code $rc. Output: $task_dir" >&2
-    exit "$rc"
-elif [[ -s "$output_file" ]]; then
-    echo "Done. Output: $output_file" >&2
-else
-    echo "Warning: agent finished but output is empty." >&2
-    exit 1
-fi
+    > "$output_file"

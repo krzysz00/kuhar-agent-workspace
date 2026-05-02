@@ -110,6 +110,7 @@ mkdir -p "$task_dir"
 
 meta_file="$task_dir/meta.json"
 start_time="$(date -Iseconds)"
+pgid="$(ps -o pgid= -p "$$" | tr -d ' ' || true)"
 
 if command -v jq >/dev/null; then
     jq -n \
@@ -119,8 +120,14 @@ if command -v jq >/dev/null; then
         --arg start "$start_time" \
         --arg timeout "$timeout_secs" \
         --arg sandbox "$sandbox_mode" \
+        --arg pid "$$" \
+        --arg pgid "$pgid" \
+        --arg supervisor_pid "${PEANUT_SUPERVISOR_PID:-}" \
         '{runner: "codex", model: $model, workspace: $workspace, prompt: $prompt,
-          start: $start, timeout: ($timeout | tonumber), sandbox: $sandbox}' \
+          start: $start, timeout: ($timeout | tonumber), sandbox: $sandbox,
+          pid: ($pid | tonumber),
+          pgid: (if $pgid == "" then null else ($pgid | tonumber) end),
+          supervisor_pid: (if $supervisor_pid == "" then null else ($supervisor_pid | tonumber) end)}' \
         > "$meta_file"
 fi
 
@@ -161,31 +168,6 @@ fi
 
 # `codex exec` reads stdin when no prompt arg is given OR when stdin is piped
 # (it appends as `<stdin>` block). Close stdin explicitly so codex doesn't
-# block waiting for input that will never arrive.
-rc=0
-timeout "$timeout_secs" "${cmd[@]}" > "$stream_file" 2>&1 < /dev/null || rc=$?
-
-end_time="$(date -Iseconds)"
-if command -v jq >/dev/null && [[ -f "$meta_file" ]]; then
-    jq --arg end "$end_time" --argjson rc "$rc" '.end = $end | .exit_code = $rc' "$meta_file" > "$meta_file.tmp" \
-        && mv "$meta_file.tmp" "$meta_file"
-fi
-
-# If --output-last-message didn't get written (e.g. agent crashed before
-# producing a message), fall back to extracting the last agent_message from
-# the JSON event stream so the orchestrator has something to look at.
-if [[ ! -s "$output_file" && -s "$stream_file" ]] && command -v jq >/dev/null; then
-    jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text' \
-        "$stream_file" 2>/dev/null | tail -n +1 > "$output_file" || true
-fi
-
-echo "" >&2
-if [[ "$rc" -ne 0 ]]; then
-    echo "Agent exited with code $rc. Output: $task_dir" >&2
-    exit "$rc"
-elif [[ -s "$output_file" ]]; then
-    echo "Done. Output: $output_file" >&2
-else
-    echo "Warning: agent finished but output is empty." >&2
-    exit 1
-fi
+# block waiting for input that will never arrive. Final metadata and timeout
+# cleanup are handled by the Python supervisor.
+exec "${cmd[@]}" > "$stream_file" 2>&1 < /dev/null

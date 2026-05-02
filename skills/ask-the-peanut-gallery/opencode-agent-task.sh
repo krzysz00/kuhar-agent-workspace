@@ -117,6 +117,7 @@ mkdir -p "$task_dir"
 
 meta_file="$task_dir/meta.json"
 start_time="$(date -Iseconds)"
+pgid="$(ps -o pgid= -p "$$" | tr -d ' ' || true)"
 
 if command -v jq >/dev/null; then
     jq -n \
@@ -126,8 +127,14 @@ if command -v jq >/dev/null; then
         --arg start "$start_time" \
         --arg timeout "$timeout_secs" \
         --arg agent "$agent_name" \
+        --arg pid "$$" \
+        --arg pgid "$pgid" \
+        --arg supervisor_pid "${PEANUT_SUPERVISOR_PID:-}" \
         '{runner: "opencode", model: $model, workspace: $workspace, prompt: $prompt,
           start: $start, timeout: ($timeout | tonumber),
+          pid: ($pid | tonumber),
+          pgid: (if $pgid == "" then null else ($pgid | tonumber) end),
+          supervisor_pid: (if $supervisor_pid == "" then null else ($supervisor_pid | tonumber) end),
           agent: ($agent | select(. != ""))}' \
         > "$meta_file"
 fi
@@ -159,22 +166,4 @@ if (( dry_run )); then
     exit 0
 fi
 
-rc=0
-timeout "$timeout_secs" "${cmd[@]}" > "$output_file" || rc=$?
-
-end_time="$(date -Iseconds)"
-if command -v jq >/dev/null && [[ -f "$meta_file" ]]; then
-    jq --arg end "$end_time" --argjson rc "$rc" '.end = $end | .exit_code = $rc' "$meta_file" > "$meta_file.tmp" \
-        && mv "$meta_file.tmp" "$meta_file"
-fi
-
-echo "" >&2
-if [[ "$rc" -ne 0 ]]; then
-    echo "Agent exited with code $rc. Output: $task_dir" >&2
-    exit "$rc"
-elif [[ -s "$output_file" ]]; then
-    echo "Done. Output: $output_file" >&2
-else
-    echo "Warning: agent finished but output is empty." >&2
-    exit 1
-fi
+exec "${cmd[@]}" > "$output_file"
