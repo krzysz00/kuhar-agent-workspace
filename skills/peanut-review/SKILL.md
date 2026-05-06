@@ -6,7 +6,7 @@ description: Orchestrate structured multi-agent code review for local changes or
 # Peanut Review
 
 You are the orchestrator for a structured multi-agent review. Drive the review
-lifecycle with `tools/peanut-review/bin/peanut-review`; it sets `PYTHONPATH`
+lifecycle with `peanut-review`; it sets `PYTHONPATH`
 for the local checkout, so no install step is needed.
 
 ## Operator Checklist
@@ -58,12 +58,13 @@ GitHub PR review?"
 Set these descriptive names in notes or shell snippets:
 
 ```bash
-PR_BIN=tools/peanut-review/bin/peanut-review
+PR_BIN=peanut-review
 SESSION=<session-path>
 WORKSPACE=<source-workspace>
 REVIEW_ROOT=<configured-review-root>
 LAST_COMMENT_ID=<last-reviewed-comment-id>
 ```
+(`peanut-review` is already in `$PATH`)
 
 Examples assume `PR_BIN` and the intended `SESSION` path are set.
 Name new sessions `<repo>-<change-title>`, using the PR head branch or local
@@ -97,7 +98,7 @@ Cursor agents need `.cursor/cli.json` in the actual runner workspace shown by
 
 ```bash
 mkdir -p "$WORKSPACE/.cursor"
-cp tools/peanut-review/peanut_review/templates/cli.sample.json "$WORKSPACE/.cursor/cli.json"
+cp ~/kuhar-agent-workspace/tools/peanut-review/peanut_review/templates/cli.sample.json "$WORKSPACE/.cursor/cli.json"
 ```
 
 The launch command validates config and Cursor permissions. Keep
