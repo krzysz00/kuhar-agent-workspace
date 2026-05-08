@@ -24,7 +24,8 @@ before running commands and keep it current.
       reachable before launching reviewers.
 - [ ] Confirm project config and reviewer permissions are valid.
 - [ ] Launch reviewers and verify startup with `status`, `inbox`, logs, and
-      `wait-all`.
+      `wait-all`. If you have a network sandbox, you need to launch the reviewers
+      outside this sandbox.
 - [ ] Answer reviewer questions promptly.
 - [ ] Track the last reviewed comment id for later `--since` queries.
 - [ ] Triage every finding: keep, delete, resolve, reply, or push to GitHub.
