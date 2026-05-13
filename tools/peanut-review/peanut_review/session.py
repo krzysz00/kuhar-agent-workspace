@@ -243,15 +243,21 @@ def _copy_session_state(dst: Session, src: Session) -> None:
 
 def refresh_agent_statuses(session_dir: str | Path, session: Session) -> bool:
     """Refresh agent states from signals, live PIDs, and supervisor metadata."""
-    from . import runtime
+    from . import runtime, sandbox
 
     changed = False
+    bwrap_pid_namespace = sandbox.bwrap_pid_namespace_detected()
     with _session_lock(session_dir):
         latest = load_session(session_dir)
         for agent in latest.agents:
             snapshot = runtime.inspect_agent_runtime(session_dir, agent)
             new_status = runtime.derive_status_from_snapshot(agent, snapshot)
-            if agent.status != new_status:
+            missing_pids = runtime.missing_recorded_process_pids(
+                snapshot,
+                bwrap_pid_namespace=bwrap_pid_namespace,
+            )
+            skip_false_failure = missing_pids and new_status == AgentStatus.FAILED.value
+            if not skip_false_failure and agent.status != new_status:
                 agent.status = new_status
                 changed = True
             for field in ("pid", "pgid", "supervisor_pid"):

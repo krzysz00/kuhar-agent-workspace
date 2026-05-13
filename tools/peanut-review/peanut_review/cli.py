@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import models, polling, runtime, session as sess, store, validation
+from . import models, polling, runtime, sandbox, session as sess, store, validation
 
 
 def _get_session_dir(args: argparse.Namespace) -> str:
@@ -198,10 +198,91 @@ def _print_launch_results(results: list[dict]) -> None:
         print(f"  {r['name']}: {pid_str}")
 
 
+def _peanut_review_command(
+    session_dir: str | Path,
+    subcommand: str,
+    *,
+    template: str | None = None,
+    cli_json: str | None = None,
+    agent_names: list[str] | None = None,
+) -> list[str]:
+    command = ["peanut-review", "--session", str(session_dir), subcommand]
+    if template:
+        command += ["--template", template]
+    if cli_json:
+        command += ["--cli-json", cli_json]
+    for agent in agent_names or []:
+        command += ["--agent", agent]
+    return command
+
+
+def _print_bwrap_spawn_note(
+    command: list[str],
+    *,
+    skipped: bool,
+    file=None,
+) -> bool:
+    """Print a launch/rerun note when Codex-style bwrap would reap agents."""
+    if not sandbox.bwrap_die_with_parent_sandbox_detected():
+        return False
+    if file is None:
+        file = sys.stderr
+    prefix = "Spawn skipped" if skipped else "Note"
+    print(
+        f"{prefix}: bubblewrap sandbox detected (--die-with-parent).",
+        file=file,
+    )
+    print(
+        "Reviewer agents spawned here can be killed when the sandboxed "
+        "command exits.",
+        file=file,
+    )
+    print("Run the spawn command outside the sandbox:", file=file)
+    print(f"  {shlex.join(command)}", file=file)
+    return True
+
+
+def _print_bwrap_pid_visibility_note(
+    agents: dict[str, list[int]],
+    *,
+    command: list[str],
+    file=None,
+) -> bool:
+    """Print a note when recorded agent PIDs are hidden by a sandbox."""
+    if not agents or not sandbox.bwrap_pid_namespace_detected():
+        return False
+    if file is None:
+        file = sys.stderr
+    details = ", ".join(
+        f"{name} pid(s)={','.join(str(pid) for pid in pids)}"
+        for name, pids in agents.items()
+    )
+    print(
+        "Note: recorded agent process PID(s) were not visible from this "
+        "bubblewrap sandbox.",
+        file=file,
+    )
+    print(f"Missing: {details}", file=file)
+    print("Rerun this command outside the sandbox:", file=file)
+    print(f"  {shlex.join(command)}", file=file)
+    return True
+
+
 def cmd_launch(args: argparse.Namespace) -> int:
     """Spawn agents."""
     session_dir = _get_session_dir(args)
     from . import launch
+    command = _peanut_review_command(
+        session_dir,
+        "launch",
+        template=args.template,
+        cli_json=getattr(args, "cli_json", None),
+        agent_names=getattr(args, "agent", None),
+    )
+    if args.dry_run:
+        _print_bwrap_spawn_note(command, skipped=False, file=sys.stdout)
+    elif _print_bwrap_spawn_note(command, skipped=True):
+        return 1
     # When --template is omitted, let launch_agents pick the default CLI
     # prompt for each agent's runner.
     try:
@@ -222,6 +303,17 @@ def cmd_rerun(args: argparse.Namespace) -> int:
     """Reset selected agents' round state and spawn them again."""
     session_dir = _get_session_dir(args)
     from . import launch
+    command = _peanut_review_command(
+        session_dir,
+        "rerun",
+        template=args.template,
+        cli_json=getattr(args, "cli_json", None),
+        agent_names=args.agent,
+    )
+    if args.dry_run:
+        _print_bwrap_spawn_note(command, skipped=False, file=sys.stdout)
+    elif _print_bwrap_spawn_note(command, skipped=True):
+        return 1
     try:
         results = launch.rerun_agents(
             session_dir,
@@ -252,6 +344,17 @@ def cmd_kill_agents(args: argparse.Namespace) -> int:
     """Terminate launched reviewer agents."""
     session_dir = _get_session_dir(args)
     from . import agent_control
+    command = _peanut_review_command(
+        session_dir,
+        "kill-agents",
+        agent_names=getattr(args, "agent", None),
+    )
+    if args.dry_run:
+        command.append("--dry-run")
+    if args.timeout != 5.0:
+        command += ["--timeout", str(args.timeout)]
+    if args.force:
+        command.append("--force")
     try:
         results = agent_control.kill_agents(
             session_dir,
@@ -272,6 +375,12 @@ def cmd_kill_agents(args: argparse.Namespace) -> int:
         print(f"  {result['name']}: {result['status']}{detail}{reason}")
         if result["status"] == "error":
             failed = True
+    missing = {
+        result["name"]: result["missing_pids"]
+        for result in results
+        if result.get("missing_pids")
+    }
+    _print_bwrap_pid_visibility_note(missing, command=command)
     return 1 if failed else 0
 
 
@@ -315,6 +424,12 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     agents = cfg["agents"]
     if args.dry_run:
+        launch_command = _peanut_review_command(
+            session_dir,
+            "launch",
+            template=args.template,
+            cli_json=getattr(args, "cli_json", None),
+        )
         print(f"Config:   {config_path}")
         print(f"Session:  {session_dir}")
         print(f"Workspace: {cfg['workspace']}")
@@ -331,8 +446,9 @@ def cmd_start(args: argparse.Namespace) -> int:
         print("Fetch comments command:")
         print(f"  peanut-review --session {shlex.quote(str(session_dir))} gh-pull")
         if not args.no_launch:
+            _print_bwrap_spawn_note(launch_command, skipped=False, file=sys.stdout)
             print("Launch command:")
-            print(f"  peanut-review --session {shlex.quote(str(session_dir))} launch")
+            print(f"  {shlex.join(launch_command)}")
         return 0
 
     session_json = session_dir / "session.json"
@@ -386,6 +502,16 @@ def cmd_start(args: argparse.Namespace) -> int:
         return 0
 
     from . import launch
+    launch_command = _peanut_review_command(
+        session_dir,
+        "launch",
+        template=args.template,
+        cli_json=getattr(args, "cli_json", None),
+    )
+    if args.launch_dry_run:
+        _print_bwrap_spawn_note(launch_command, skipped=False, file=sys.stdout)
+    elif _print_bwrap_spawn_note(launch_command, skipped=True):
+        return 1
     results = launch.launch_agents(
         str(session_dir), args.template,
         dry_run=args.launch_dry_run,
@@ -1079,16 +1205,31 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     # Agents
     print("Agents:")
+    missing_processes: dict[str, list[int]] = {}
+    bwrap_pid_namespace = sandbox.bwrap_pid_namespace_detected()
     for a in s.agents:
         snapshot = runtime.inspect_agent_runtime(session_dir, a)
-        status = runtime.derive_status_from_snapshot(a, snapshot)
+        missing_pids = runtime.missing_recorded_process_pids(
+            snapshot,
+            bwrap_pid_namespace=bwrap_pid_namespace,
+        )
+        status = a.status if missing_pids else runtime.derive_status_from_snapshot(a, snapshot)
+        process_state = snapshot["process_state"]
+        if missing_pids and process_state == runtime.PROCESS_FAILED:
+            process_state = "unknown"
         model = runtime.compact_model(a.model)
         details = " ".join(runtime.status_detail_parts(snapshot, status))
         print(
             f"  {a.name:<12} {status:<8} {model:<22} "
-            f"process={snapshot['process_state']:<9} "
+            f"process={process_state:<9} "
             f"review={snapshot['protocol_status']:<7} {details}"
         )
+        if missing_pids:
+            missing_processes[a.name] = missing_pids
+    _print_bwrap_pid_visibility_note(
+        missing_processes,
+        command=["peanut-review", "--session", str(session_dir), "status"],
+    )
 
     # Comment counts — deleted comments are hidden from the total but
     # surfaced separately for transparency.

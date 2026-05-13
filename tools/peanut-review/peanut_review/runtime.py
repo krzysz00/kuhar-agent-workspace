@@ -238,6 +238,22 @@ def inspect_agent_runtime(session_dir: str | Path, agent: AgentConfig) -> dict[s
     }
 
 
+def missing_recorded_process_pids(
+    snapshot: dict[str, Any],
+    *,
+    bwrap_pid_namespace: bool = False,
+) -> list[int]:
+    """Return recorded agent PIDs that are not visible and lack final metadata."""
+    if not bwrap_pid_namespace or snapshot["has_final_meta"]:
+        return []
+    result: list[int] = []
+    if snapshot["pid"] and not snapshot["reviewer_live"]:
+        result.append(snapshot["pid"])
+    if snapshot["supervisor_pid"] and not snapshot["supervisor_live"]:
+        result.append(snapshot["supervisor_pid"])
+    return result
+
+
 def derive_status_from_snapshot(agent: AgentConfig, snapshot: dict[str, Any]) -> str:
     if snapshot["protocol_status"] == PROTOCOL_DONE:
         return AgentStatus.DONE.value
