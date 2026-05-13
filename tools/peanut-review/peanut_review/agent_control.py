@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import runtime, session as sess
+from . import runtime, sandbox, session as sess
 
 
 SUPPORTED_RUNNERS = {"cursor", "opencode", "codex"}
@@ -244,6 +244,7 @@ def _kill_one_agent(
     force: bool,
 ) -> dict[str, Any]:
     snapshot = runtime.inspect_agent_runtime(session_dir, agent)
+    bwrap_pid_namespace = sandbox.bwrap_pid_namespace_detected()
     runner = _runner_name(agent, snapshot)
     result: dict[str, Any] = {
         "name": agent.name,
@@ -254,12 +255,23 @@ def _kill_one_agent(
         "pgid": snapshot["pgid"],
         "supervisor_pid": snapshot["supervisor_pid"],
         "process_state": snapshot["process_state"],
+        "missing_pids": runtime.missing_recorded_process_pids(
+            snapshot,
+            bwrap_pid_namespace=bwrap_pid_namespace,
+        ),
         "signals": [],
     }
 
     if runner not in SUPPORTED_RUNNERS:
         result["status"] = "error"
         result["reason"] = f"unsupported runner: {runner}"
+        return result
+    if result["missing_pids"]:
+        result["status"] = "error"
+        result["reason"] = (
+            "recorded pid(s) not visible in bwrap PID namespace: "
+            + ", ".join(str(pid) for pid in result["missing_pids"])
+        )
         return result
 
     reviewer_pid = snapshot["pid"]

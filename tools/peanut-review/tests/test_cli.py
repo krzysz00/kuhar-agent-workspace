@@ -2,6 +2,7 @@
 import io
 import json
 import os
+import shlex
 import tempfile
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
@@ -117,6 +118,52 @@ def test_launch_agent_option_reports_unknown_agent():
     assert "vera" in err.getvalue()
 
 
+def test_launch_refuses_spawn_inside_die_with_parent_sandbox():
+    sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
+    _init_session(sd, agents=[
+        {"name": "vera", "model": "opus", "persona": "vera.md"},
+    ])
+
+    err = io.StringIO()
+    with (
+        patch("peanut_review.sandbox.bwrap_die_with_parent_sandbox_detected",
+              return_value=True),
+        patch("peanut_review.launch.launch_agents") as launch_agents,
+        redirect_stderr(err),
+    ):
+        rc = main(["--session", sd, "launch", "--agent", "vera"])
+
+    assert rc == 1
+    launch_agents.assert_not_called()
+    text = err.getvalue()
+    assert "Spawn skipped: bubblewrap sandbox detected" in text
+    assert "--die-with-parent" in text
+    assert shlex.join([
+        "peanut-review", "--session", sd, "launch", "--agent", "vera"
+    ]) in text
+
+
+def test_launch_dry_run_notes_die_with_parent_sandbox_but_runs():
+    sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
+    _init_session(sd, workspace=_make_cursor_workspace(), agents=[
+        {"name": "vera", "model": "opus", "persona": "vera.md"},
+    ])
+
+    out = io.StringIO()
+    with (
+        patch("peanut_review.sandbox.bwrap_die_with_parent_sandbox_detected",
+              return_value=True),
+        redirect_stdout(out),
+    ):
+        rc = main(["--session", sd, "launch", "--dry-run", "--agent", "vera"])
+
+    assert rc == 0
+    text = out.getvalue()
+    assert "Note: bubblewrap sandbox detected" in text
+    assert "Run the spawn command outside the sandbox:" in text
+    assert "vera: dry-run" in text
+
+
 def test_rerun_dry_run_targets_agent_without_clearing_signals():
     from peanut_review import polling
 
@@ -169,6 +216,37 @@ def test_kill_agents_cli_prints_results():
 
     assert rc == 0
     assert "vera: dry-run SIGTERM pgid=123" in out.getvalue()
+
+
+def test_kill_agents_notes_missing_recorded_pids_inside_sandbox():
+    sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
+    _init_session(sd, agents=[
+        {"name": "vera", "model": "opus", "persona": "vera.md"},
+    ])
+    s = sess.load_session(sd)
+    s.agents[0].status = "running"
+    s.agents[0].pid = 999999999
+    sess.save_session(sd, s)
+
+    out = io.StringIO()
+    err = io.StringIO()
+    with (
+        patch("peanut_review.sandbox.bwrap_pid_namespace_detected",
+              return_value=True),
+        redirect_stdout(out),
+        redirect_stderr(err),
+    ):
+        rc = main(["--session", sd, "kill-agents", "--agent", "vera"])
+
+    assert rc == 1
+    assert "vera: error" in out.getvalue()
+    assert "recorded pid(s) not visible" in out.getvalue()
+    text = err.getvalue()
+    assert "recorded agent process PID(s) were not visible" in text
+    assert "vera pid(s)=999999999" in text
+    assert shlex.join([
+        "peanut-review", "--session", sd, "kill-agents", "--agent", "vera"
+    ]) in text
 
 
 def test_start_validates_cursor_cli_before_resolving_pr(tmp_path: Path):
@@ -418,6 +496,115 @@ def test_status(mock_git):
     assert "review=pending" in text
     assert "signal=no" in text
     assert "comments=0" in text
+
+
+@patch("peanut_review.session._run_git", side_effect=_mock_git)
+def test_status_notes_missing_recorded_pids_inside_sandbox(mock_git):
+    sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
+    main(["--session", sd, "init", "--workspace", "/tmp/repo",
+          "--agents", json.dumps([{"name": "vera", "model": "opus", "persona": "vera.md"}])])
+    s = sess.load_session(sd)
+    s.agents[0].status = "running"
+    s.agents[0].pid = 999999999
+    sess.save_session(sd, s)
+
+    out = io.StringIO()
+    err = io.StringIO()
+    with (
+        patch("peanut_review.sandbox.bwrap_pid_namespace_detected",
+              return_value=True),
+        redirect_stdout(out),
+        redirect_stderr(err),
+    ):
+        rc = main(["--session", sd, "status"])
+
+    assert rc == 0
+    assert "vera" in out.getvalue()
+    assert "process=unknown" in out.getvalue()
+    assert sess.load_session(sd).agents[0].status == "running"
+    text = err.getvalue()
+    assert "recorded agent process PID(s) were not visible" in text
+    assert "vera pid(s)=999999999" in text
+    assert shlex.join(["peanut-review", "--session", sd, "status"]) in text
+
+
+@patch("peanut_review.session._run_git", side_effect=_mock_git)
+def test_status_does_not_note_missing_recorded_pids_outside_sandbox(mock_git):
+    sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
+    main(["--session", sd, "init", "--workspace", "/tmp/repo",
+          "--agents", json.dumps([{"name": "vera", "model": "opus", "persona": "vera.md"}])])
+    s = sess.load_session(sd)
+    s.agents[0].status = "running"
+    s.agents[0].pid = 999999999
+    sess.save_session(sd, s)
+
+    err = io.StringIO()
+    with (
+        patch("peanut_review.sandbox.bwrap_pid_namespace_detected",
+              return_value=False),
+        redirect_stdout(io.StringIO()),
+        redirect_stderr(err),
+    ):
+        rc = main(["--session", sd, "status"])
+
+    assert rc == 0
+    assert "recorded agent process PID(s)" not in err.getvalue()
+    assert sess.load_session(sd).agents[0].status == "failed"
+
+
+@patch("peanut_review.session._run_git", side_effect=_mock_git)
+def test_status_notes_missing_pid_for_done_agent_without_final_meta(mock_git):
+    sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
+    main(["--session", sd, "init", "--workspace", "/tmp/repo",
+          "--agents", json.dumps([{"name": "vera", "model": "opus", "persona": "vera.md"}])])
+    s = sess.load_session(sd)
+    s.agents[0].status = "running"
+    s.agents[0].pid = 999999999
+    sess.save_session(sd, s)
+    from peanut_review import polling
+    polling.write_signal(sd, "vera", "round-done")
+
+    err = io.StringIO()
+    with (
+        patch("peanut_review.sandbox.bwrap_pid_namespace_detected",
+              return_value=True),
+        redirect_stdout(io.StringIO()),
+        redirect_stderr(err),
+    ):
+        rc = main(["--session", sd, "status"])
+
+    assert rc == 0
+    assert "recorded agent process PID(s)" in err.getvalue()
+
+
+@patch("peanut_review.session._run_git", side_effect=_mock_git)
+def test_status_does_not_note_missing_pid_with_final_meta(mock_git):
+    sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
+    main(["--session", sd, "init", "--workspace", "/tmp/repo",
+          "--agents", json.dumps([{"name": "vera", "model": "opus", "persona": "vera.md"}])])
+    from peanut_review import runtime
+    runtime.update_agent_meta(sd, "vera", {
+        "pid": 999999999,
+        "process_state": "exited",
+        "exit_code": 0,
+        "end": "2026-05-13T00:00:00+00:00",
+    })
+    s = sess.load_session(sd)
+    s.agents[0].status = "running"
+    s.agents[0].pid = 999999999
+    sess.save_session(sd, s)
+
+    err = io.StringIO()
+    with (
+        patch("peanut_review.sandbox.bwrap_pid_namespace_detected",
+              return_value=True),
+        redirect_stdout(io.StringIO()),
+        redirect_stderr(err),
+    ):
+        rc = main(["--session", sd, "status"])
+
+    assert rc == 0
+    assert "recorded agent process PID(s)" not in err.getvalue()
 
 
 @patch("peanut_review.session._run_git", side_effect=_mock_git)
@@ -910,7 +1097,9 @@ def test_refresh_agent_statuses_marks_dead_no_signal_as_failed():
     sess.save_session(sd, s)
 
     from peanut_review.session import refresh_agent_statuses as _refresh_agent_statuses
-    changed = _refresh_agent_statuses(sd, s)
+    with patch("peanut_review.sandbox.bwrap_pid_namespace_detected",
+               return_value=False):
+        changed = _refresh_agent_statuses(sd, s)
     assert changed is True
     assert s.agents[0].status == "failed"
 
@@ -931,7 +1120,9 @@ def test_refresh_agent_statuses_stale_running_meta_is_failed():
     sess.save_session(sd, s)
 
     from peanut_review.session import refresh_agent_statuses as _refresh_agent_statuses
-    changed = _refresh_agent_statuses(sd, s)
+    with patch("peanut_review.sandbox.bwrap_pid_namespace_detected",
+               return_value=False):
+        changed = _refresh_agent_statuses(sd, s)
     assert changed is True
     assert s.agents[0].status == "failed"
 
