@@ -41,8 +41,8 @@ GitHub PR orchestration:
 Set up peanut-review for <PR URL> under <review-root>. Use the existing
 .peanut-review.json, confirm the exact reviewer lineup and runner/model choices
 before launching, and start with --no-launch so I can build/test the checkout.
-After reviewers signal round-done, kill agents and help me curate feedback for
-the web UI push flow.
+After reviewers signal round-done, wait-all should run the curator; help me
+inspect the curated feedback for the web UI push flow.
 ```
 
 Local author-owned review:
@@ -80,13 +80,17 @@ or repo:
   "repoRelative": "my-repo",
   "reviewAgentTimeoutSeconds": 1200,
   "agents": [
-    {"name": "Vera", "model": "gpt-5.5", "persona": "vera.md", "runner": "codex"},
-    {"name": "Irene", "model": "claude-opus-4-7-thinking-medium", "persona": "irene.md", "runner": "cursor"}
+    {"name": "Vera", "model": "gpt-5.5", "reasoningEffort": "high", "persona": "vera.md", "runner": "codex"},
+    {"name": "Irene", "model": "claude-opus-4-7-thinking-medium", "persona": "irene.md", "runner": "cursor"},
+    {"name": "Curator", "model": "gpt-5.5-high", "runner": "cursor", "role": "curator"}
   ]
 }
 ```
 
 Supported runners: `cursor`, `opencode`, `codex`.
+GitHub PR sessions require a configured agent with `"role": "curator"` because
+the curator model is intentionally owned by project config, not by Python
+defaults.
 
 Cursor runners need permissions in the reviewed workspace before `launch`:
 
@@ -122,10 +126,11 @@ SESSION=<printed-session-path>
 "$PR_BIN" --session "$SESSION" launch --dry-run
 "$PR_BIN" --session "$SESSION" launch
 "$PR_BIN" --session "$SESSION" wait-all round-done --timeout 900
-"$PR_BIN" --session "$SESSION" kill-agents
 ```
 
-Curate in the web UI, then use the UI's GitHub push modal when ready:
+For GitHub-backed sessions, `wait-all round-done` waits for reviewers, then
+launches the dedicated `Curator` agent and waits for it to finish. Inspect the
+curated result in the web UI, then use the UI's GitHub push modal when ready:
 
 ```bash
 "$PR_BIN" --session "$SESSION" gh-pull
@@ -133,6 +138,10 @@ Curate in the web UI, then use the UI's GitHub push modal when ready:
 "$PR_BIN" --session "$SESSION" edit c_1234abcd --body-file /tmp/comment.md
 "$PR_BIN" --session "$SESSION" delete c_9999ffff
 ```
+
+The web UI also exposes manual **curate** and **rerun all** controls in the
+Agents section when you need to rerun comment curation or start a fresh
+reviewer pass.
 
 ## Flow: Local Branch
 
@@ -145,7 +154,8 @@ SESSION=$REVIEW_ROOT/my-repo-my-branch
 WORKSPACE=$PWD
 AGENTS='[
   {"name":"Vera","model":"gpt-5.5","persona":"vera.md","runner":"codex"},
-  {"name":"Irene","model":"claude-opus-4-7-thinking-medium","persona":"irene.md","runner":"cursor"}
+  {"name":"Irene","model":"claude-opus-4-7-thinking-medium","persona":"irene.md","runner":"cursor"},
+  {"name":"Curator","model":"gpt-5.5-high","runner":"cursor","role":"curator"}
 ]'
 
 "$PR_BIN" --session "$SESSION" init \
@@ -160,6 +170,13 @@ AGENTS='[
 "$PR_BIN" --session "$SESSION" comments --unresolved
 ```
 
+Local sessions do not run the curator automatically. If you want comment
+cleanup before fixing the patch, use the web UI's **curate** button or:
+
+```bash
+"$PR_BIN" --session "$SESSION" curate
+```
+
 After fixing code:
 
 ```bash
@@ -168,7 +185,7 @@ COMMENT_ID=c_1234abcd
 
 "$PR_BIN" --session "$SESSION" resolve "$COMMENT_ID"
 "$PR_BIN" --session "$SESSION" migrate
-"$PR_BIN" --session "$SESSION" signal-all next-round
+"$PR_BIN" --session "$SESSION" rerun --agent Vera --agent Irene
 "$PR_BIN" --session "$SESSION" wait-all round-done --timeout 900
 "$PR_BIN" --session "$SESSION" verdict --approve --body "All critical issues addressed"
 ```
@@ -187,12 +204,12 @@ gh pr co "$PR"
 "$PR_BIN" --session "$SESSION" comments --since "$LAST_COMMENT_ID"
 ```
 
-Relaunch agents only for substantial changes:
+Rerun agents only for substantial changes. Use `rerun`, not `launch`, so stale
+round signals are cleared before the selected reviewers start:
 
 ```bash
-"$PR_BIN" --session "$SESSION" launch
+"$PR_BIN" --session "$SESSION" rerun --agent Vera --agent Irene
 "$PR_BIN" --session "$SESSION" wait-all round-done --timeout 900
-"$PR_BIN" --session "$SESSION" kill-agents
 ```
 
 ## Common Commands
@@ -204,6 +221,7 @@ Relaunch agents only for substantial changes:
 "$PR_BIN" --session "$SESSION" note --message "Ran targeted tests; passed."
 "$PR_BIN" --session "$SESSION" add-comment --file path/to/file.py --line 42 --severity warning --body-file /tmp/body.md
 "$PR_BIN" --session "$SESSION" comments --unresolved   # use this to find c_... ids
+"$PR_BIN" --session "$SESSION" curate                 # launch the comment curator
 "$PR_BIN" --session "$SESSION" add-global-comment --severity suggestion --body "A few comments."
 "$PR_BIN" --session "$SESSION" add-global-comment --category request-changes --body-file /tmp/blocking.md
 ```

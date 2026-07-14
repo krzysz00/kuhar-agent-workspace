@@ -6,6 +6,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 
 
 def _now_iso() -> str:
@@ -84,6 +85,11 @@ class AgentStatus(str, Enum):
     TIMEOUT = "timeout"
 
 
+class AgentRole(str, Enum):
+    REVIEWER = "reviewer"
+    CURATOR = "curator"
+
+
 @dataclass
 class Comment:
     id: str = field(default_factory=lambda: _short_id("c"))
@@ -110,9 +116,10 @@ class Comment:
     deleted: bool = False
     deleted_by: str | None = None
     deleted_at: str | None = None
-    # Threading — replies point at a top-level comment id. Replies do not
-    # nest: setting reply_to on a reply silently re-roots to its parent's
-    # parent, so trees are at most one level deep (GitHub-style).
+    # Threading — replies point at a top-level anchored comment id. Global
+    # comments cannot have replies because GitHub does not support them.
+    # Replies do not nest: setting reply_to on a reply silently re-roots to
+    # its parent's parent, so trees are at most one level deep (GitHub-style).
     reply_to: str | None = None
     # External provenance — set when imported from or pushed to a remote
     # provider (currently only "github"). external_synced_body holds the body
@@ -177,7 +184,9 @@ class Note:
 class AgentConfig:
     name: str = ""
     model: str = ""
+    reasoning_effort: str = ""
     persona: str = ""
+    role: str = AgentRole.REVIEWER.value
     status: str = AgentStatus.PENDING.value
     # Runtime identity. `pid` is the top-level reviewer process PID after the
     # runner wrapper has exec'd the real agent command. `pgid` is the process
@@ -192,11 +201,20 @@ class AgentConfig:
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        return {k: v for k, v in d.items() if v is not None}
+        reasoning_effort = d.pop("reasoning_effort")
+        return {
+            k: v
+            for k, v in d.items()
+            if v is not None
+            and not (k == "role" and v == AgentRole.REVIEWER.value)
+        } | ({"reasoningEffort": reasoning_effort} if reasoning_effort else {})
 
     @classmethod
     def from_dict(cls, d: dict) -> AgentConfig:
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+        raw = dict(d)
+        if "reasoningEffort" in raw:
+            raw.setdefault("reasoning_effort", raw.pop("reasoningEffort"))
+        return cls(**{k: v for k, v in raw.items() if k in cls.__dataclass_fields__})
 
 
 @dataclass
@@ -228,7 +246,10 @@ class Session:
     version: int = 1
     id: str = ""
     created_at: str = field(default_factory=_now_iso)
+    # Agent launch/workspace root. For nested checkouts, repo_relative points
+    # at the Git repository under this directory.
     workspace: str = ""
+    repo_relative: str = ""
     base_ref: str = "main"
     topic_ref: str = "HEAD"
     original_head: str = ""
@@ -239,6 +260,14 @@ class Session:
     state: str = SessionState.INIT.value
     timeout: int = 1200
     github: GitHubPR | None = None
+    # Comment id used as the lower bound for the next curator run. Reviewer
+    # launch/rerun updates this so the curator can focus on fresh findings.
+    curation_since_comment_id: str | None = None
+
+    def repo_path(self) -> str:
+        if not self.repo_relative or self.repo_relative == ".":
+            return self.workspace
+        return str((Path(self.workspace) / self.repo_relative).resolve())
 
     def to_json(self) -> str:
         d = asdict(self)

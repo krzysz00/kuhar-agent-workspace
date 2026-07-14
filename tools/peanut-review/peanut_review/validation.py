@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from .models import AgentConfig
+from .models import AgentConfig, AgentRole
 
 
 SUPPORTED_RUNNERS = {"cursor", "opencode", "codex"}
@@ -71,8 +71,23 @@ def _validate_agent_configs(
                 errors.append(f"duplicate agent name: {name}")
             seen.add(name)
 
+        role = agent.get("role", AgentRole.REVIEWER.value)
+        valid_roles = {role.value for role in AgentRole}
+        if not isinstance(role, str) or not role.strip():
+            errors.append(f"{label}.role must be a non-empty string")
+        elif role not in valid_roles:
+            errors.append(
+                f"{label}.role {role!r} is unsupported "
+                f"(expected one of {', '.join(sorted(valid_roles))})"
+            )
+
         _as_non_empty_string(agent.get("model"), f"{label}.model", errors)
-        persona = _as_non_empty_string(agent.get("persona"), f"{label}.persona", errors)
+        persona_raw = agent.get("persona")
+        persona = ""
+        if role == AgentRole.CURATOR.value and not persona_raw:
+            pass
+        else:
+            persona = _as_non_empty_string(persona_raw, f"{label}.persona", errors)
         if persona:
             persona_path = Path(persona)
             if persona_path.is_absolute() or ".." in persona_path.parts:
@@ -88,6 +103,13 @@ def _validate_agent_configs(
                 f"{label}.runner {runner!r} is unsupported "
                 f"(expected one of {', '.join(sorted(SUPPORTED_RUNNERS))})"
             )
+
+        reasoning_effort = agent.get("reasoningEffort", agent.get("reasoning_effort", ""))
+        if reasoning_effort:
+            if not isinstance(reasoning_effort, str) or not reasoning_effort.strip():
+                errors.append(f"{label}.reasoningEffort must be a non-empty string")
+            elif runner != "codex":
+                errors.append(f"{label}.reasoningEffort is only supported with runner 'codex'")
 
         try:
             agents.append(AgentConfig.from_dict(agent).to_dict())
@@ -133,14 +155,14 @@ def validate_project_config(
             errors.append("repoRelative must be relative")
         if ".." in repo_relative.parts:
             errors.append("repoRelative must stay under workspaceRoot")
-    workspace = (workspace_root / repo_relative).resolve()
+    repo_path = (workspace_root / repo_relative).resolve()
 
     if review_root.exists() and not review_root.is_dir():
         errors.append(f"reviewRoot exists but is not a directory: {review_root}")
     if not workspace_root.is_dir():
         errors.append(f"workspaceRoot does not exist or is not a directory: {workspace_root}")
-    if not workspace.is_dir():
-        errors.append(f"configured workspace does not exist: {workspace}")
+    if not repo_path.is_dir():
+        errors.append(f"configured repository does not exist: {repo_path}")
 
     timeout = data.get("reviewAgentTimeoutSeconds", 1200)
     if not isinstance(timeout, int) or timeout <= 0:
@@ -173,7 +195,8 @@ def validate_project_config(
     cfg["reviewRoot"] = str(review_root)
     cfg["workspaceRoot"] = str(workspace_root)
     cfg["repoRelative"] = str(repo_relative)
-    cfg["workspace"] = str(workspace)
+    cfg["workspace"] = str(workspace_root)
+    cfg["repoPath"] = str(repo_path)
     cfg["reviewAgentTimeoutSeconds"] = timeout
     cfg["agents"] = agents
     if personas_dir is not None:

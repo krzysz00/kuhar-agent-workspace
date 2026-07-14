@@ -11,6 +11,7 @@
     { value: "dark-plus", label: "Dark+" },
     { value: "light", label: "light" },
   ];
+  const COPY_SESSION_ICON = "▣";
 
   // --- Utilities ---
   function esc(s) {
@@ -82,6 +83,57 @@
   }
   applyTheme(storedTheme());
   document.getElementById("theme-toggle")?.addEventListener("click", cycleTheme);
+
+  function fallbackCopyText(text) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    ta.style.top = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      if (!document.execCommand("copy")) {
+        throw new Error("copy command failed");
+      }
+    } finally {
+      ta.remove();
+    }
+  }
+
+  async function copyTextToClipboard(text) {
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return;
+      } catch { /* fall back below */ }
+    }
+    fallbackCopyText(text);
+  }
+
+  async function copySessionId() {
+    const btn = document.getElementById("copy-session-id");
+    if (!btn) return;
+    const value = btn.dataset.sessionId || sessionId || "";
+    if (!value) return;
+    try {
+      await copyTextToClipboard(value);
+      btn.classList.add("copied");
+      btn.textContent = COPY_SESSION_ICON;
+      btn.title = "Session name copied";
+      flashToast("Session name copied", 1200);
+      setTimeout(() => {
+        btn.classList.remove("copied");
+        btn.textContent = COPY_SESSION_ICON;
+        btn.title = "Copy session name";
+      }, 1600);
+    } catch {
+      flashToast("Could not copy session name", 1800);
+    }
+  }
+  document.getElementById("copy-session-id")?.addEventListener("click", copySessionId);
+
   function api(method, path, body) {
     const opts = { method, headers: { "Content-Type": "application/json" } };
     if (body !== undefined) opts.body = JSON.stringify(body);
@@ -248,12 +300,15 @@
     `;
   }
 
-  function renderThreadActions(parentId, resolved) {
+  function renderThreadActions(parentId, resolved, allowReply) {
     const toggle = resolved
       ? `<button data-unresolve="${esc(parentId)}">Unresolve</button>`
       : `<button data-resolve="${esc(parentId)}">Resolve</button>`;
+    const reply = allowReply
+      ? `<button class="reply-btn" data-reply-to="${esc(parentId)}">Reply</button>`
+      : "";
     return `<div class="thread-actions">
-      <button class="reply-btn" data-reply-to="${esc(parentId)}">Reply</button>
+      ${reply}
       ${toggle}
     </div>`;
   }
@@ -270,7 +325,7 @@
       <div class="${cls.join(" ")}" data-thread-id="${esc(parent.id)}" data-default-collapsed="${defaultCollapsed}">
         ${renderComment(parent)}
         <div class="thread-collapsed-summary" data-collapse-summary>${collapseSummary(0)}</div>
-        ${renderThreadActions(parent.id, parent.resolved)}
+        ${renderThreadActions(parent.id, parent.resolved, parent.file !== "")}
       </div>
     `;
   }
@@ -481,10 +536,13 @@
   function lineElsBetween(file, lo, hi) {
     const fileEl = document.querySelector(`.file[data-file="${cssEsc(file)}"]`);
     if (!fileEl) return [];
+    if (lo === hi) {
+      const row = rowForNewLine(fileEl, lo);
+      return row ? [row] : [];
+    }
     const out = [];
-    for (const el of fileEl.querySelectorAll(".line")) {
-      const newLn = el.querySelector(".ln.new");
-      const n = newLn ? Number(newLn.dataset.line) : NaN;
+    for (const el of fileEl.querySelectorAll(".line[data-new-line]")) {
+      const n = Number(el.dataset.newLine);
       if (Number.isInteger(n) && n >= lo && n <= hi) out.push(el);
     }
     return out;
@@ -682,6 +740,293 @@
     }
   }
 
+  const MAX_FOLD_EXPAND_LINES = 100;
+  let dynamicFoldId = 0;
+
+  function renderExpandedFoldLine(line) {
+    const kind = ["context", "added", "deleted"].includes(line.kind)
+      ? line.kind
+      : "context";
+    const row = document.createElement("div");
+    row.className = `line ${kind}`;
+
+    const oldLn = document.createElement("span");
+    oldLn.className = "ln old";
+    oldLn.textContent = line.old_lineno == null ? "" : String(line.old_lineno);
+    if (line.old_lineno != null) row.dataset.oldLine = String(line.old_lineno);
+
+    const newLn = document.createElement("span");
+    newLn.className = "ln new";
+    newLn.textContent = line.new_lineno == null ? "" : String(line.new_lineno);
+    const dataLine = line.new_lineno == null ? line.old_lineno : line.new_lineno;
+    if (dataLine != null) newLn.dataset.line = String(dataLine);
+    if (line.new_lineno != null) row.dataset.newLine = String(line.new_lineno);
+
+    const content = document.createElement("span");
+    content.className = "content";
+    content.textContent = line.content || "";
+
+    row.append(oldLn, newLn, content);
+    return row;
+  }
+
+  function numberedBounds(lines, field) {
+    const nums = lines
+      .map((line) => line[field])
+      .filter((n) => Number.isInteger(n));
+    if (!nums.length) return [null, null];
+    return [nums[0], nums[nums.length - 1]];
+  }
+
+  function lineSpanLabel(start, end) {
+    if (start == null || end == null) return "";
+    return start === end ? String(start) : `${start}-${end}`;
+  }
+
+  function foldLabel(count, kind = "unchanged") {
+    return `${count} ${kind} line${count === 1 ? "" : "s"} hidden`;
+  }
+
+  function updateFoldGapMetadata(gap, lines, { file = "", startIndex = null } = {}) {
+    const count = lines.length;
+    const kinds = new Set(lines.map((line) => line.kind || "context"));
+    let kind = "diff";
+    if (kinds.size === 1 && kinds.has("context")) kind = "unchanged";
+    else if (kinds.size === 1 && kinds.has("added")) kind = "added";
+    else if (kinds.size === 1 && kinds.has("deleted")) kind = "deleted";
+    const label = foldLabel(count, kind);
+    const [oldStart, oldEnd] = numberedBounds(lines, "old_lineno");
+    const [newStart, newEnd] = numberedBounds(lines, "new_lineno");
+    gap.dataset.foldedLines = String(count);
+    if (file) gap.dataset.foldFile = file;
+    if (Number.isInteger(startIndex)) {
+      gap.dataset.foldStartIndex = String(startIndex);
+      gap.dataset.foldEndIndex = String(startIndex + count);
+    }
+    const attrs = [
+      ["foldOldStart", oldStart],
+      ["foldOldEnd", oldEnd],
+      ["foldNewStart", newStart],
+      ["foldNewEnd", newEnd],
+    ];
+    for (const [name, value] of attrs) {
+      if (value == null) delete gap.dataset[name];
+      else gap.dataset[name] = String(value);
+    }
+    const titleParts = [label];
+    const oldSpan = lineSpanLabel(oldStart, oldEnd);
+    const newSpan = lineSpanLabel(newStart, newEnd);
+    if (oldSpan) titleParts.push(`old ${oldSpan}`);
+    if (newSpan) titleParts.push(`new ${newSpan}`);
+    gap.title = titleParts.join(" | ");
+    const countEl = gap.querySelector(".fold-count");
+    if (countEl) countEl.textContent = label;
+  }
+
+  function createFoldGapBase(foldId) {
+    const gap = document.createElement("div");
+    gap.className = "line fold-gap";
+
+    const oldMarker = document.createElement("span");
+    oldMarker.className = "ln old fold-marker";
+    oldMarker.textContent = "...";
+
+    const newMarker = document.createElement("span");
+    newMarker.className = "ln new fold-marker";
+    newMarker.textContent = "...";
+
+    const content = document.createElement("span");
+    content.className = "content fold-summary";
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "fold-toggle";
+    button.dataset.foldExpand = foldId;
+    button.textContent = "Expand";
+
+    const count = document.createElement("span");
+    count.className = "fold-count";
+
+    content.append(button, count);
+    gap.append(oldMarker, newMarker, content);
+    return gap;
+  }
+
+  function createFoldGapNodes(foldId, lines, options = {}) {
+    const gap = createFoldGapBase(foldId);
+    updateFoldGapMetadata(gap, lines, options);
+
+    const payload = document.createElement("script");
+    payload.type = "application/json";
+    payload.id = `fold-data-${foldId}`;
+    payload.className = "fold-payload";
+    payload.textContent = JSON.stringify(lines);
+    return [gap, payload];
+  }
+
+  function appendFoldGap(fragment, baseId, label, lines, options = {}) {
+    if (!lines.length) return;
+    const foldId = `${baseId}-${label}-${dynamicFoldId++}`;
+    const [gap, payload] = createFoldGapNodes(foldId, lines, options);
+    fragment.append(gap, payload);
+  }
+
+  function appendLazyFoldGap(fragment, baseId, label, options) {
+    const start = Number(options.startIndex);
+    const end = Number(options.endIndex);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || end <= start) return;
+    const foldId = `${baseId}-${label}-${dynamicFoldId++}`;
+    const gap = createFoldGapBase(foldId);
+    gap.dataset.foldFile = options.file || "";
+    gap.dataset.foldStartIndex = String(start);
+    gap.dataset.foldEndIndex = String(end);
+    gap.dataset.foldedLines = String(end - start);
+    gap.title = foldLabel(end - start, "diff");
+    const countEl = gap.querySelector(".fold-count");
+    if (countEl) countEl.textContent = gap.title;
+    fragment.append(gap);
+  }
+
+  function chunkStartForFold(lines, lineNo) {
+    if (lineNo == null) return 0;
+    const idx = lines.findIndex((line) => line.new_lineno === lineNo);
+    if (idx < 0) return 0;
+    const halfWindow = Math.floor(MAX_FOLD_EXPAND_LINES / 2);
+    return Math.max(
+      0,
+      Math.min(idx - halfWindow, Math.max(0, lines.length - MAX_FOLD_EXPAND_LINES)),
+    );
+  }
+
+  function foldIndex(gap, name) {
+    const value = Number(gap?.dataset?.[name]);
+    return Number.isInteger(value) ? value : null;
+  }
+
+  function foldFile(gap) {
+    return gap?.dataset?.foldFile || gap?.closest(".file")?.dataset?.file || "";
+  }
+
+  async function fetchFoldLines(gap, start, end) {
+    const file = foldFile(gap);
+    if (!file) throw new Error("fold is missing file metadata");
+    const params = new URLSearchParams({
+      file,
+      start: String(start),
+      end: String(end),
+    });
+    return api("GET", `/api/diff/fold?${params.toString()}`);
+  }
+
+  async function expandLazyFoldGap(gap, { lineNo = null } = {}) {
+    const start = foldIndex(gap, "foldStartIndex");
+    const end = foldIndex(gap, "foldEndIndex");
+    if (start == null || end == null || end <= start) return false;
+    const button = gap.querySelector("[data-fold-expand]");
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Loading";
+    }
+
+    let fetchStart = start;
+    const newStart = Number(gap.dataset.foldNewStart);
+    const newEnd = Number(gap.dataset.foldNewEnd);
+    if (lineNo != null && Number.isFinite(newStart) && Number.isFinite(newEnd)) {
+      const lo = Math.min(newStart, newEnd);
+      const hi = Math.max(newStart, newEnd);
+      if (lineNo >= lo && lineNo <= hi) {
+        const approxOffset = Math.max(0, Math.min(lineNo - lo, end - start));
+        fetchStart = Math.max(
+          start,
+          Math.min(
+            start + approxOffset - Math.floor(MAX_FOLD_EXPAND_LINES / 2),
+            Math.max(start, end - MAX_FOLD_EXPAND_LINES),
+          ),
+        );
+      }
+    }
+    const fetchEnd = Math.min(end, fetchStart + MAX_FOLD_EXPAND_LINES);
+    const data = await fetchFoldLines(gap, fetchStart, fetchEnd);
+    const lines = data.lines || [];
+    const baseId = gap.querySelector("[data-fold-expand]")?.dataset.foldExpand || "fold";
+    const frag = document.createDocumentFragment();
+    appendLazyFoldGap(frag, baseId, "before", {
+      file: foldFile(gap),
+      startIndex: start,
+      endIndex: fetchStart,
+    });
+    for (const line of lines) frag.appendChild(renderExpandedFoldLine(line));
+    appendLazyFoldGap(frag, baseId, "after", {
+      file: foldFile(gap),
+      startIndex: fetchStart + lines.length,
+      endIndex: end,
+    });
+    gap.before(frag);
+    gap.remove();
+    updateStickyOffsets();
+    return true;
+  }
+
+  function expandFoldGap(gap, { lineNo = null, allowFetch = true } = {}) {
+    if (!gap) return false;
+    const btn = gap.querySelector("[data-fold-expand]");
+    const foldId = btn && btn.dataset.foldExpand;
+    if (!foldId) return false;
+    const payload = document.getElementById(`fold-data-${foldId}`);
+    if (!payload) {
+      if (!allowFetch) return false;
+      expandLazyFoldGap(gap, { lineNo }).catch((e) => {
+        const retry = gap.querySelector("[data-fold-expand]");
+        if (retry) {
+          retry.disabled = false;
+          retry.textContent = "Expand";
+        }
+        alert("Could not load folded lines: " + e.message);
+      });
+      return true;
+    }
+    let lines;
+    try {
+      lines = JSON.parse(payload.textContent || "[]");
+    } catch {
+      return false;
+    }
+    const chunkStart = chunkStartForFold(lines, lineNo);
+    const chunkEnd = Math.min(lines.length, chunkStart + MAX_FOLD_EXPAND_LINES);
+    const before = lines.slice(0, chunkStart);
+    const chunk = lines.slice(chunkStart, chunkEnd);
+    const after = lines.slice(chunkEnd);
+    const frag = document.createDocumentFragment();
+    const file = foldFile(gap);
+    const startIndex = foldIndex(gap, "foldStartIndex") || 0;
+    appendFoldGap(frag, foldId, "before", before, {
+      file,
+      startIndex,
+    });
+    for (const line of chunk) frag.appendChild(renderExpandedFoldLine(line));
+    appendFoldGap(frag, foldId, "after", after, {
+      file,
+      startIndex: startIndex + chunkEnd,
+    });
+    gap.before(frag);
+    payload.remove();
+    gap.remove();
+    updateStickyOffsets();
+    return true;
+  }
+
+  function expandFoldGapContainingLine(fileEl, lineNo) {
+    for (const gap of fileEl.querySelectorAll(".fold-gap")) {
+      const start = Number(gap.dataset.foldNewStart);
+      const end = Number(gap.dataset.foldNewEnd);
+      if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+      if (lineNo >= Math.min(start, end) && lineNo <= Math.max(start, end)) {
+        return expandFoldGap(gap, { lineNo, allowFetch: false });
+      }
+    }
+    return false;
+  }
+
   // Edit + history. Edit replaces the comment-body with a textarea + Save/Cancel.
   // History toggles a panel under the comment showing prior versions inline.
   function applyEditedComment(node, c) {
@@ -808,6 +1153,11 @@
       openGlobalForm();
       return;
     }
+    const foldBtn = ev.target.closest("[data-fold-expand]");
+    if (foldBtn) {
+      expandFoldGap(foldBtn.closest(".fold-gap"));
+      return;
+    }
     const collapseBtn = ev.target.closest("[data-thread-collapse]");
     if (collapseBtn) {
       const threadEl = collapseBtn.closest(".thread");
@@ -898,12 +1248,17 @@
   // against the DOM: insert new ones, remove vanished ones, reflect resolved
   // state changes. Meant to run while agents are posting during a review.
 
+  function rowForNewLine(fileEl, lineNo) {
+    return fileEl.querySelector(`.line[data-new-line="${lineNo}"]`);
+  }
+
   function findRowForAnchor(fileEl, lineNo) {
     // Match the `.ln.new` (right-gutter) cell that carries the new-file line
     // number, same axis threads are keyed on server-side.
-    for (const el of fileEl.querySelectorAll(".line")) {
-      const newLn = el.querySelector(".ln.new");
-      if (newLn && Number(newLn.dataset.line) === lineNo) return el;
+    const row = rowForNewLine(fileEl, lineNo);
+    if (row) return row;
+    if (expandFoldGapContainingLine(fileEl, lineNo)) {
+      return rowForNewLine(fileEl, lineNo);
     }
     return null;
   }
@@ -1265,6 +1620,10 @@
     return process === "launching" || process === "running";
   }
 
+  function isReviewerAgent(agent) {
+    return String(agent.role || "reviewer") !== "curator";
+  }
+
   function renderAgentRow(agent) {
     const name = String(agent.name || "");
     const model = String(agent.model || "");
@@ -1310,6 +1669,22 @@
       const anyKillable = agents.some(agentCanKill);
       killAll.hidden = !anyKillable;
       killAll.disabled = !anyKillable;
+    }
+    const rerunAll = document.getElementById("rerun-all-agents-btn");
+    if (rerunAll) {
+      const reviewers = agents.filter(isReviewerAgent);
+      rerunAll.disabled = reviewers.length === 0 || reviewers.some(agentCanKill);
+      rerunAll.title = reviewers.some(agentCanKill)
+        ? "Wait for live reviewer agents to finish before rerunning"
+        : "Rerun all reviewer agents";
+    }
+    const curatorRun = document.getElementById("curator-run-btn");
+    if (curatorRun) {
+      const curator = agents.find((agent) => !isReviewerAgent(agent));
+      curatorRun.disabled = curator ? agentCanKill(curator) : false;
+      curatorRun.title = curatorRun.disabled
+        ? "Wait for the live curator to finish before rerunning"
+        : "Run comment curator";
     }
   }
 
@@ -1358,6 +1733,52 @@
   const killAllAgentsBtn = document.getElementById("kill-all-agents-btn");
   if (killAllAgentsBtn) {
     killAllAgentsBtn.addEventListener("click", () => killAgents(null));
+  }
+
+  async function rerunAllAgents() {
+    const btn = document.getElementById("rerun-all-agents-btn");
+    if (!confirm("Rerun all reviewer agents?")) return;
+    document.querySelectorAll(".agent-kill, #kill-all-agents-btn, #rerun-all-agents-btn").forEach((b) => {
+      b.disabled = true;
+    });
+    try {
+      const res = await api("POST", "/api/agents/rerun", {});
+      updateAgentList(res.agents || []);
+      const names = (res.results || []).map((r) => r.name).filter(Boolean);
+      flashToast(names.length ? `Rerun: ${names.join(", ")}` : "Rerun started");
+    } catch (e) {
+      alert("Rerun failed: " + e.message);
+    } finally {
+      await refreshSidebar();
+    }
+  }
+
+  const rerunAllAgentsBtn = document.getElementById("rerun-all-agents-btn");
+  if (rerunAllAgentsBtn) {
+    rerunAllAgentsBtn.addEventListener("click", rerunAllAgents);
+  }
+
+  async function launchCurator() {
+    const btn = document.getElementById("curator-run-btn");
+    if (btn) btn.disabled = true;
+    try {
+      const res = await api("POST", "/api/curator/launch", {});
+      updateAgentList(res.agents || []);
+      const first = (res.results || [])[0];
+      const detail = first && first.supervisor_pid
+        ? `supervisor=${first.supervisor_pid}`
+        : "started";
+      flashToast(`Curator ${detail}`);
+    } catch (e) {
+      alert("Curator launch failed: " + e.message);
+    } finally {
+      await refreshSidebar();
+    }
+  }
+
+  const curatorRunBtn = document.getElementById("curator-run-btn");
+  if (curatorRunBtn) {
+    curatorRunBtn.addEventListener("click", launchCurator);
   }
 
   // --- Periodic session refresh (for state/signals) ---
@@ -1464,13 +1885,19 @@
   }
 
   function renderNewItem(it) {
-    return `<li class="push-item" data-id="${esc(it.id)}">`
+    const cls = it.promoted_to_global ? "push-item promoted" : "push-item";
+    const ref = it.promoted_to_global ? (it.original_ref || it.ref) : it.ref;
+    const promoted = it.promoted_to_global
+      ? `<span class="warn">promote to global (${esc(it.promotion_reason || "invalid anchor")})</span>`
+      : "";
+    return `<li class="${cls}" data-id="${esc(it.id)}">`
       + `<div class="push-meta">`
       +   renderIncludeControl(it, "new")
       +   `<span class="mono">${esc(it.id)}</span>`
       +   `<span class="sev ${esc(it.severity)}">${esc(it.severity)}</span>`
       +   categoryBadge(it)
-      +   `<span class="ref mono">${esc(it.ref)}</span>`
+      +   `<span class="ref mono">${esc(ref)}</span>`
+      +   promoted
       +   `<span class="muted">by ${esc(it.author || "unknown")}</span>`
       +   renderPushActions(it)
       + `</div>`
@@ -1479,7 +1906,11 @@
   }
   function renderReplyItem(it) {
     let tag;
-    if (it.orphaned) {
+    if (it.unsupported_reason) {
+      tag = `<span class="warn">${esc(it.unsupported_reason)}</span>`;
+    } else if (it.parent_promoted_to_global) {
+      tag = `<span class="warn">skipped (parent promoted to global)</span>`;
+    } else if (it.orphaned) {
       tag = `<span class="warn">orphaned (parent not pushed)</span>`;
     } else if (it.parent_pending) {
       tag = `<span class="muted">→ local parent</span>`;
@@ -1552,6 +1983,11 @@
       }
       if (plan.skipped_imported_reviews) {
         html += `<p class="muted">Skipping ${plan.skipped_imported_reviews} imported review${plan.skipped_imported_reviews === 1 ? "" : "s"} (already backed by GitHub review objects).</p>`;
+      }
+      if (plan.anchor_validation_error) {
+        html += `<p class="warn">Anchor validation skipped: ${esc(plan.anchor_validation_error)}</p>`;
+      } else if (plan.promoted) {
+        html += `<p class="warn">${plan.promoted} comment${plan.promoted === 1 ? "" : "s"} outside the GitHub review diff will be promoted to global.</p>`;
       }
       if (orphans) {
         html += `<p class="warn">${orphans} repl${orphans === 1 ? "y is" : "ies are"} orphaned and will be skipped.</p>`;

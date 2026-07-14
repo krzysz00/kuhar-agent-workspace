@@ -17,12 +17,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .. import agent_control, gh, gh_pull, gh_push, polling, runtime, store
+from .. import agent_control, gh, gh_pull, gh_push, launch, polling, runtime, store
 from ..models import Comment, CommentCategory, Note, Severity, normalize_comment_category
 from ..session import (
     GLOBAL_FILE,
     load_session,
     refresh_agent_statuses,
+    repo_path,
+    reviewer_agents,
+    retarget_review_head,
     save_session,
     validate_comment_location,
 )
@@ -136,6 +139,8 @@ class SessionRegistry:
                 "github_title": github_title,
                 "created_at": s.created_at,
                 "workspace": s.workspace,
+                "repo_relative": s.repo_relative,
+                "repo_path": repo_path(s),
                 "session_subtitle": session_subtitle,
                 "current_head": (s.current_head or "")[:12],
                 "comment_count": len(live),
@@ -163,20 +168,27 @@ def _git_head(workspace: str) -> str | None:
     return None
 
 
-def _auto_migrate_if_shifted(session_dir: Path) -> tuple[bool, str | None]:
-    """If the workspace HEAD moved, mark stale + update current_head.
+def _auto_migrate_if_shifted(session_dir: Path) -> tuple[bool, str | None, bool]:
+    """If the workspace HEAD moved, mark stale + update review-head metadata.
 
-    Returns (shifted, new_head). `shifted` is True only when we actually
-    migrated on this call.
+    Returns (shifted, new_head, changed). `shifted` is True only when comments
+    were marked stale on this call. `changed` is also True when stale session
+    metadata was repaired without a new HEAD shift.
     """
     s = load_session(session_dir)
-    live = _git_head(s.workspace)
-    if not live or live == s.current_head:
-        return False, live
-    store.mark_stale(session_dir)
-    s.current_head = live
-    save_session(session_dir, s)
-    return True, live
+    live = _git_head(repo_path(s))
+    if not live:
+        return False, live, False
+    shifted = live != s.current_head
+    try:
+        changed = retarget_review_head(s, live)
+    except RuntimeError:
+        return False, live, False
+    if shifted:
+        store.mark_stale(session_dir)
+    if changed:
+        save_session(session_dir, s)
+    return shifted, live, changed
 
 
 ROUTE_RE = re.compile(r"^/([^/]+)(/.*)?$")
@@ -185,6 +197,7 @@ ROUTE_RE = re.compile(r"^/([^/]+)(/.*)?$")
 RESERVED_ROOTS = {"api"}
 VALID_SEVERITIES = {s.value for s in Severity}
 VALID_CATEGORIES = {c.value for c in CommentCategory}
+MAX_DIFF_FOLD_FETCH_LINES = 200
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -267,13 +280,15 @@ class _Handler(BaseHTTPRequestHandler):
 
         session = load_session(session_dir)
         refresh_agent_statuses(session_dir, session)
-        shifted, _ = _auto_migrate_if_shifted(session_dir)
+        shifted, _, session_changed = _auto_migrate_if_shifted(session_dir)
+        if session_changed:
+            session = load_session(session_dir)
 
         if tail in ("/", ""):
             comments = store.read_all_comments(session_dir)
             notes = store.read_all_notes(session_dir)
             files = diffmod.parse_diff(
-                session.workspace, session.base_ref, session.topic_ref,
+                repo_path(session), session.base_ref, session.topic_ref,
             )
             transcript = polling.list_transcript(session_dir)
             agent_runtime = {}
@@ -312,6 +327,8 @@ class _Handler(BaseHTTPRequestHandler):
                 "original_head": session.original_head,
                 "current_head": session.current_head,
                 "workspace": session.workspace,
+                "repo_relative": session.repo_relative,
+                "repo_path": repo_path(session),
                 "agents": _agent_payload(session_dir, session),
                 "comment_count": len(live),
                 "note_count": len(notes),
@@ -360,6 +377,10 @@ class _Handler(BaseHTTPRequestHandler):
                 since=(q.get("since", [None])[0]),
             )
             self._json(200, [_note_to_dict(n) for n in notes])
+            return
+
+        if tail == "/api/diff/fold":
+            self._get_diff_fold(session_dir, url.query)
             return
 
         if tail == "/api/gh/preview":
@@ -412,6 +433,12 @@ class _Handler(BaseHTTPRequestHandler):
         if tail == "/api/agents/kill":
             self._post_agents_kill(session_dir, data)
             return
+        if tail == "/api/agents/rerun":
+            self._post_agents_rerun(session_dir)
+            return
+        if tail == "/api/curator/launch":
+            self._post_curator_launch(session_dir)
+            return
         self._error(404, f"no route for {tail}")
 
     # -------- endpoints --------
@@ -444,6 +471,10 @@ class _Handler(BaseHTTPRequestHandler):
                     "approve/request-changes categories cannot be used on replies",
                 )
             parent = next(c for c in all_comments if c.id == reply_to)
+            if parent.file == GLOBAL_FILE:
+                return self._error(
+                    400, "replies to global comments are not supported"
+                )
             file = parent.file
             line = parent.line
             end_line = None
@@ -473,7 +504,7 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._error(400, "line must be an integer")
                 end_line = data.get("end_line")
                 session = load_session(session_dir)
-                _, err = validate_comment_location(session.workspace, file, line)
+                _, err = validate_comment_location(repo_path(session), file, line)
                 if err:
                     return self._error(400, err)
 
@@ -576,10 +607,14 @@ class _Handler(BaseHTTPRequestHandler):
         if s.github is None:
             return self._error(400, "session is not GitHub-backed")
         comments = store.read_all_comments(session_dir)
-        plan = gh_push.plan_push(comments)
+        anchor_index = gh_push.build_review_anchor_index(
+            repo_path(s), s.base_ref, s.topic_ref,
+        )
+        plan = gh_push.plan_push(comments, anchor_index=anchor_index)
         by_id = {c.id: c for c in comments}
         agent_authors = _agent_authors(s)
         new_top_ids = {c.id for c in plan.new_top}
+        promoted_ids = set(plan.promoted_anchors)
         default_push_ids = _default_selected_push_ids(plan, agent_authors)
 
         def _ref(c: Comment) -> str:
@@ -594,25 +629,44 @@ class _Handler(BaseHTTPRequestHandler):
                 "default_included": c.id in default_push_ids,
             }
 
-        new_top = [{
-            "id": c.id, "author": c.author, "severity": c.severity,
-            "category": c.category,
-            "ref": _ref(c), "body": c.body,
-            **_item_defaults(c),
-        } for c in plan.new_top]
+        new_top = []
+        for c in plan.new_top:
+            promotion = plan.promoted_anchors.get(c.id)
+            item = {
+                "id": c.id, "author": c.author, "severity": c.severity,
+                "category": c.category,
+                "ref": _ref(c), "body": c.body,
+                **_item_defaults(c),
+            }
+            if promotion is not None:
+                item.update({
+                    "promoted_to_global": True,
+                    "original_ref": promotion.ref,
+                    "promotion_reason": promotion.reason,
+                })
+            new_top.append(item)
         new_replies = []
         for c in plan.new_replies:
             parent = by_id.get(c.reply_to or "")
             parent_ext = plan.ext_map.get(c.reply_to or "")
-            parent_pending = c.reply_to in new_top_ids
-            orphaned = parent_ext is None and not parent_pending
+            parent_promoted = c.reply_to in promoted_ids
+            parent_pending = c.reply_to in new_top_ids and not parent_promoted
+            unsupported_reason = (
+                "GitHub does not support replies to global comments"
+                if c.file == GLOBAL_FILE else None
+            )
+            orphaned = bool(unsupported_reason) or (
+                parent_ext is None and not parent_pending
+            )
             new_replies.append({
                 "id": c.id, "author": c.author,
                 "ref": _ref(parent) if parent else "?",
                 "parent_id": c.reply_to,
                 "parent_external_id": parent_ext,
                 "parent_pending": parent_pending,
+                "parent_promoted_to_global": parent_promoted,
                 "orphaned": orphaned,
+                "unsupported_reason": unsupported_reason,
                 "body": c.body,
                 **_item_defaults(c),
             })
@@ -636,7 +690,39 @@ class _Handler(BaseHTTPRequestHandler):
             "edits": edits,
             "skipped_meta": plan.skipped_meta,
             "skipped_imported_reviews": plan.skipped_imported_reviews,
+            "anchor_validation_error": plan.anchor_validation_error,
+            "promoted": len(plan.promoted_anchors),
             "total": plan.total,
+        })
+
+    def _get_diff_fold(self, session_dir: Path, query: str) -> None:
+        q = parse_qs(query)
+        file_path = q.get("file", [""])[0]
+        if not file_path:
+            return self._error(400, "missing file")
+        try:
+            start = int(q.get("start", ["0"])[0])
+            end = int(q.get("end", [str(start + MAX_DIFF_FOLD_FETCH_LINES)])[0])
+        except ValueError:
+            return self._error(400, "start/end must be integers")
+        if start < 0 or end < start:
+            return self._error(400, "invalid start/end range")
+
+        end = min(end, start + MAX_DIFF_FOLD_FETCH_LINES)
+        s = load_session(session_dir)
+        files = diffmod.parse_diff(repo_path(s), s.base_ref, s.topic_ref)
+        fd = next((f for f in files if f.path == file_path), None)
+        if fd is None:
+            return self._error(404, f"diff file not found: {file_path}")
+
+        end = min(end, len(fd.lines))
+        lines = fd.lines[start:end] if start < len(fd.lines) else []
+        self._json(200, {
+            "file": fd.path,
+            "start": start,
+            "end": start + len(lines),
+            "total": len(fd.lines),
+            "lines": [_diff_line_to_dict(dl) for dl in lines],
         })
 
     def _post_gh_push(self, session_dir: Path, data: dict) -> None:
@@ -647,7 +733,10 @@ class _Handler(BaseHTTPRequestHandler):
         if s.github is None:
             return self._error(400, "session is not GitHub-backed")
         comments = store.read_all_comments(session_dir)
-        plan = gh_push.plan_push(comments)
+        anchor_index = gh_push.build_review_anchor_index(
+            repo_path(s), s.base_ref, s.topic_ref,
+        )
+        plan = gh_push.plan_push(comments, anchor_index=anchor_index)
         try:
             selected_ids = _selected_push_ids(data)
         except ValueError as e:
@@ -669,6 +758,7 @@ class _Handler(BaseHTTPRequestHandler):
             "pushed": result.pushed,
             "failed": result.failed,
             "orphaned": result.orphaned,
+            "promoted": result.promoted,
             "skipped_meta": result.skipped_meta,
             "skipped_imported_reviews": result.skipped_imported_reviews,
             "items": [
@@ -725,6 +815,35 @@ class _Handler(BaseHTTPRequestHandler):
             "agents": _agent_payload(session_dir, session),
         })
 
+    def _post_agents_rerun(self, session_dir: Path) -> None:
+        session = load_session(session_dir)
+        agent_names = [agent.name for agent in reviewer_agents(session)]
+        if not agent_names:
+            return self._error(400, "no reviewer agents configured")
+
+        try:
+            results = launch.rerun_agents(session_dir, agent_names=agent_names)
+        except (FileNotFoundError, ValueError) as e:
+            return self._error(400, str(e))
+
+        session = load_session(session_dir)
+        self._json(202, {
+            "results": results,
+            "agents": _agent_payload(session_dir, session),
+        })
+
+    def _post_curator_launch(self, session_dir: Path) -> None:
+        try:
+            results = launch.launch_curator(session_dir)
+        except (FileNotFoundError, ValueError) as e:
+            return self._error(400, str(e))
+
+        session = load_session(session_dir)
+        self._json(202, {
+            "results": results,
+            "agents": _agent_payload(session_dir, session),
+        })
+
 
 def _comment_to_dict(c: Comment) -> dict:
     return {
@@ -755,6 +874,15 @@ def _comment_to_dict(c: Comment) -> dict:
     }
 
 
+def _diff_line_to_dict(dl: diffmod.DiffLine) -> dict:
+    return {
+        "kind": dl.kind,
+        "old_lineno": dl.old_lineno,
+        "new_lineno": dl.new_lineno,
+        "content": dl.content,
+    }
+
+
 def _agent_authors(session) -> set[str]:
     return {a.name.lower() for a in session.agents}
 
@@ -775,6 +903,8 @@ def _default_selected_push_ids(plan: gh_push.PushPlan, agent_authors: set[str]) 
     }
     for c in plan.new_replies:
         if c.author.lower() in agent_authors:
+            continue
+        if c.file == GLOBAL_FILE:
             continue
         parent_id = c.reply_to or ""
         if plan.ext_map.get(parent_id) or parent_id in selected:
@@ -798,6 +928,7 @@ def _agent_payload(session_dir: Path, session) -> list[dict]:
         payload.append({
             "name": agent.name,
             "model": agent.model,
+            "role": agent.role,
             "status": runtime.derive_status_from_snapshot(agent, snapshot),
             "process_status": snapshot["process_state"],
             "protocol_status": snapshot["protocol_status"],

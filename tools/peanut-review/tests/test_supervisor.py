@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from peanut_review import session as sess
+from peanut_review.models import GitHubPR
 from peanut_review.supervisor import supervise_agent
 
 
@@ -20,14 +21,23 @@ def _mock_git(workspace, *args):
     return ""
 
 
-def _make_session_dir() -> str:
+def _make_session_dir(
+    *,
+    agents: list[dict] | None = None,
+    github: GitHubPR | None = None,
+    include_curator: bool = False,
+) -> str:
     sd = os.path.join(tempfile.mkdtemp(prefix="pr-supervisor-"), "session")
     with patch("peanut_review.session._run_git", side_effect=_mock_git):
         sess.create_session(
             workspace=tempfile.mkdtemp(prefix="pr-workspace-"),
-            agents=[{"name": "vera", "model": "test-model", "persona": "vera.md"}],
+            agents=agents or [
+                {"name": "vera", "model": "test-model", "persona": "vera.md"},
+            ],
             session_dir=sd,
             timeout=30,
+            github=github,
+            include_curator=include_curator,
         )
     return sd
 
@@ -72,6 +82,137 @@ def test_supervisor_records_done_when_signal_exists(tmp_path):
     assert loaded.agents[0].pid is not None
     assert loaded.agents[0].pgid is not None
     assert loaded.agents[0].supervisor_pid == os.getpid()
+
+
+def test_supervisor_does_not_auto_launch_curator_when_github_reviewers_done(tmp_path):
+    sd = _make_session_dir(
+        agents=[
+            {"name": "vera", "model": "test-model", "persona": "vera.md"},
+            {"name": "Curator", "model": "gpt-5.5-high", "role": "curator"},
+        ],
+        github=GitHubPR(repo="acme/foo", number=42),
+        include_curator=True,
+    )
+    script = _script(
+        tmp_path,
+        "ok.sh",
+        f"""
+        mkdir -p "{sd}/signals"
+        date -Iseconds > "{sd}/signals/vera.round-done"
+        exec sh -c 'exit 0'
+        """,
+    )
+
+    with patch("peanut_review.launch.launch_curator") as mocked:
+        rc = supervise_agent(
+            session_dir=sd,
+            agent_name="vera",
+            command=[script],
+            timeout=5,
+            kill_grace=0.1,
+        )
+
+    assert rc == 0
+    mocked.assert_not_called()
+    assert not (Path(sd) / "signals" / "Curator.auto-launching").exists()
+
+
+def test_supervisor_leaves_curator_launch_to_wait_all_even_with_marker(tmp_path):
+    sd = _make_session_dir(
+        agents=[
+            {"name": "vera", "model": "test-model", "persona": "vera.md"},
+            {"name": "Curator", "model": "gpt-5.5-high", "role": "curator"},
+        ],
+        github=GitHubPR(repo="acme/foo", number=42),
+        include_curator=True,
+    )
+    signals = Path(sd) / "signals"
+    signals.mkdir(exist_ok=True)
+    (signals / "Curator.auto-launching").write_text("already launching\n")
+    script = _script(
+        tmp_path,
+        "ok.sh",
+        f"""
+        date -Iseconds > "{sd}/signals/vera.round-done"
+        exec sh -c 'exit 0'
+        """,
+    )
+
+    with patch("peanut_review.launch.launch_curator") as mocked:
+        rc = supervise_agent(
+            session_dir=sd,
+            agent_name="vera",
+            command=[script],
+            timeout=5,
+            kill_grace=0.1,
+        )
+
+    assert rc == 0
+    mocked.assert_not_called()
+
+
+def test_supervisor_stops_process_after_round_done_signal(tmp_path):
+    sd = _make_session_dir()
+    script = _script(
+        tmp_path,
+        "wait_after_done.sh",
+        f"""
+        mkdir -p "{sd}/signals"
+        date -Iseconds > "{sd}/signals/vera.round-done"
+        sleep 30
+        """,
+    )
+
+    rc = supervise_agent(
+        session_dir=sd,
+        agent_name="vera",
+        command=[script],
+        timeout=5,
+        kill_grace=0.1,
+        round_done_grace=0.1,
+        round_done_poll_interval=0.05,
+    )
+
+    assert rc != 0
+    meta = json.loads((Path(sd) / "log" / "vera" / "meta.json").read_text())
+    assert meta["timed_out"] is False
+    assert meta["round_done_observed"] is True
+    assert meta["stopped_after_round_done"] is True
+    assert meta["process_state"] == "stopped"
+    assert meta["termination_signal"] in {"SIGTERM", "SIGKILL"}
+    loaded = sess.load_session(sd)
+    assert loaded.agents[0].status == "done"
+
+
+def test_supervisor_ignores_stale_round_done_signal(tmp_path):
+    sd = _make_session_dir()
+    signals = Path(sd) / "signals"
+    signals.mkdir(exist_ok=True)
+    (signals / "vera.round-done").write_text("stale\n")
+    script = _script(
+        tmp_path,
+        "ignore_stale_done.sh",
+        """
+        sleep 30
+        """,
+    )
+
+    rc = supervise_agent(
+        session_dir=sd,
+        agent_name="vera",
+        command=[script],
+        timeout=0.2,
+        kill_grace=0.1,
+        round_done_grace=0.1,
+        round_done_poll_interval=0.05,
+    )
+
+    assert rc != 0
+    meta = json.loads((Path(sd) / "log" / "vera" / "meta.json").read_text())
+    assert meta["timed_out"] is True
+    assert meta["round_done_observed"] is False
+    assert meta["stopped_after_round_done"] is False
+    assert meta["process_state"] == "timeout"
 
 
 def test_supervisor_records_failed_without_signal(tmp_path):

@@ -6,14 +6,16 @@ import os
 import subprocess
 import tempfile
 import threading
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from peanut_review import session as sess, store
-from peanut_review.models import AgentConfig, Comment, GitHubPR, Note
+from peanut_review.models import AgentConfig, AgentRole, Comment, GitHubPR, Note
 from peanut_review.web import app as web_app
 from peanut_review.web import diff as diffmod
 from peanut_review.web import render
@@ -47,6 +49,82 @@ def repo(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def session_dir(tmp_path: Path, repo: Path) -> Path:
+    sd = tmp_path / "sess"
+    sess.create_session(
+        workspace=str(repo),
+        base_ref="main~1",
+        topic_ref="main",
+        agents=[{"name": "felix", "model": "m", "persona": "felix.md"}],
+        session_dir=str(sd),
+    )
+    return sd
+
+
+def _long_repo(tmp_path: Path, *, line_count: int, changed_line: int) -> Path:
+    wd = tmp_path / "long-repo"
+    wd.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(wd)], check=True)
+    subprocess.run(["git", "-C", str(wd), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(wd), "config", "user.name", "t"], check=True)
+    base_lines = [
+        f"value_{i:03d} = {i}\n"
+        for i in range(1, line_count + 1)
+    ]
+    (wd / "long.py").write_text("".join(base_lines))
+    _git(wd, "add", ".")
+    _git(wd, "commit", "-q", "-m", "base")
+    changed_lines = list(base_lines)
+    changed_lines[changed_line - 1] = f"value_{changed_line:03d} = 'changed'\n"
+    (wd / "long.py").write_text("".join(changed_lines))
+    _git(wd, "commit", "-q", "-am", "change long file")
+    return wd
+
+
+def _new_large_file_repo(tmp_path: Path, *, line_count: int) -> Path:
+    wd = tmp_path / "new-large-file-repo"
+    wd.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(wd)], check=True)
+    subprocess.run(["git", "-C", str(wd), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(wd), "config", "user.name", "t"], check=True)
+    (wd / "seed.txt").write_text("base\n")
+    _git(wd, "add", ".")
+    _git(wd, "commit", "-q", "-m", "base")
+    (wd / "generated.py").write_text("".join(
+        f"value_{i:03d} = {i}\n"
+        for i in range(1, line_count + 1)
+    ))
+    _git(wd, "add", ".")
+    _git(wd, "commit", "-q", "-m", "add generated")
+    return wd
+
+
+def _dense_large_file_repo(
+    tmp_path: Path,
+    *,
+    line_count: int,
+    change_every: int,
+) -> Path:
+    wd = tmp_path / "dense-large-file-repo"
+    wd.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(wd)], check=True)
+    subprocess.run(["git", "-C", str(wd), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(wd), "config", "user.name", "t"], check=True)
+    base_lines = [
+        f"value_{i:04d} = {i}\n"
+        for i in range(1, line_count + 1)
+    ]
+    (wd / "dense.py").write_text("".join(base_lines))
+    _git(wd, "add", ".")
+    _git(wd, "commit", "-q", "-m", "base")
+    changed_lines = list(base_lines)
+    for i in range(change_every, line_count + 1, change_every):
+        changed_lines[i - 1] = f"value_{i:04d} = 'changed'\n"
+    (wd / "dense.py").write_text("".join(changed_lines))
+    _git(wd, "commit", "-q", "-am", "dense change")
+    return wd
+
+
+def _session_for_repo(tmp_path: Path, repo: Path) -> Path:
     sd = tmp_path / "sess"
     sess.create_session(
         workspace=str(repo),
@@ -113,6 +191,89 @@ def test_render_page_smoke(session_dir: Path, repo: Path):
     assert 'localStorage.getItem("pr.theme")' in html
 
 
+def test_render_page_folds_long_unchanged_context(tmp_path: Path):
+    repo = _long_repo(tmp_path, line_count=120, changed_line=60)
+    session_dir = _session_for_repo(tmp_path, repo)
+    s = sess.load_session(session_dir)
+    files = diffmod.parse_diff(str(repo), s.base_ref, s.topic_ref)
+
+    html = render.render_page(s, s.id, files, [], head_shifted=False)
+
+    assert 'class="line fold-gap"' in html
+    assert 'data-folded-lines="27"' in html
+    assert 'class="fold-toggle"' in html
+    assert 'data-fold-expand=' in html
+    assert 'class="fold-payload"' in html
+    assert "MAX_FOLD_EXPAND_LINES = 100" in html
+    assert "27 unchanged lines hidden" in html
+    assert "28 unchanged lines hidden" in html
+    assert html.count('class="line context"') < 80
+    assert "value_028" in html
+    assert "value_092" in html
+
+
+def test_render_page_folds_large_added_files(tmp_path: Path):
+    repo = _new_large_file_repo(tmp_path, line_count=250)
+    session_dir = _session_for_repo(tmp_path, repo)
+    s = sess.load_session(session_dir)
+    files = diffmod.parse_diff(str(repo), s.base_ref, s.topic_ref)
+
+    html = render.render_page(s, s.id, files, [], head_shifted=False)
+
+    assert "generated.py" in html
+    assert "added lines hidden" in html
+    assert html.count('class="line added"') < 150
+    assert 'data-new-line="1"' in html
+
+
+def test_render_page_caps_dense_large_file_initial_rows(tmp_path: Path):
+    repo = _dense_large_file_repo(tmp_path, line_count=3000, change_every=5)
+    session_dir = _session_for_repo(tmp_path, repo)
+    s = sess.load_session(session_dir)
+    files = diffmod.parse_diff(str(repo), s.base_ref, s.topic_ref)
+
+    html = render.render_page(s, s.id, files, [], head_shifted=False)
+
+    assert "dense.py" in html
+    assert html.count('class="line ') < 500
+    assert 'data-fold-start-index=' in html
+    assert 'data-fold-end-index=' in html
+    assert 'class="fold-payload"' not in html
+    assert '<span class="hl-' not in html
+
+
+def test_render_page_keeps_comment_anchor_visible_in_large_file(tmp_path: Path):
+    repo = _dense_large_file_repo(tmp_path, line_count=3000, change_every=5)
+    session_dir = _session_for_repo(tmp_path, repo)
+    s = sess.load_session(session_dir)
+    files = diffmod.parse_diff(str(repo), s.base_ref, s.topic_ref)
+    c = Comment(author="vera", file="dense.py", line=2500, body="late comment",
+                severity="warning")
+
+    html = render.render_page(s, s.id, files, [c], head_shifted=False)
+
+    assert "late comment" in html
+    assert "value_2500" in html
+    assert 'data-line="2500"' in html
+
+
+def test_render_page_keeps_comment_anchor_visible_when_context_folded(
+    tmp_path: Path,
+):
+    repo = _long_repo(tmp_path, line_count=160, changed_line=120)
+    session_dir = _session_for_repo(tmp_path, repo)
+    s = sess.load_session(session_dir)
+    files = diffmod.parse_diff(str(repo), s.base_ref, s.topic_ref)
+    c = Comment(author="vera", file="long.py", line=5, body="look here",
+                severity="warning")
+
+    html = render.render_page(s, s.id, files, [c], head_shifted=False)
+
+    assert "look here" in html
+    assert "value_005" in html
+    assert 'data-line="5"' in html
+
+
 def test_render_page_keeps_file_header_sticky(session_dir: Path, repo: Path):
     s = sess.load_session(session_dir)
     files = diffmod.parse_diff(str(repo), s.base_ref, s.topic_ref)
@@ -146,6 +307,20 @@ def test_render_page_labels_round_state_as_in_review(
     assert 'data-session-state="round"' in header
     assert ">in review</span>" in header
     assert ">round</span>" not in header
+
+
+def test_render_page_has_copy_session_name_button(session_dir: Path, repo: Path):
+    s = sess.load_session(session_dir)
+    files = diffmod.parse_diff(str(repo), s.base_ref, s.topic_ref)
+    html = render.render_page(s, s.id, files, [], head_shifted=False)
+    header = html[html.index("<header>"):html.index("</header>")]
+
+    assert 'id="copy-session-id"' in header
+    assert 'class="copy-session-id"' in header
+    assert f'data-session-id="{s.id}"' in header
+    assert 'title="Copy session name"' in header
+    assert ">▣</button>" in header
+    assert "copyTextToClipboard" in html
 
 
 def test_render_page_uses_github_title_for_change_label(
@@ -240,6 +415,9 @@ def test_render_sidebar_files_list_with_counts(session_dir: Path, repo: Path):
                               head_shifted=False)
 
     assert "<h3>Files " in html, "sidebar should have a Files heading"
+    assert 'class="sidebar-heading files-heading"' in html
+    assert '<span class="file-total-stats" title="Cumulative lines changed">' in html
+    assert '<span class="add">+1</span> <span class="del">-1</span>' in html
     assert 'class="files"' in html
     # Anchor id on file section + matching href in sidebar.
     assert 'id="f-foo-py"' in html
@@ -299,6 +477,34 @@ def test_render_sidebar_agents_show_kill_controls_when_running(
     assert '<span class="agent-state-label">review</span> <span class="agent-state-value">pending</span>' in html
 
 
+def test_render_sidebar_local_sessions_show_curator_button(
+    session_dir: Path,
+    repo: Path,
+):
+    s = sess.load_session(session_dir)
+    files = diffmod.parse_diff(str(repo), s.base_ref, s.topic_ref)
+    html = render.render_page(s, s.id, files, [], head_shifted=False)
+
+    assert 'id="curator-run-btn"' in html
+    assert 'title="Run comment curator"' in html
+    assert 'id="rerun-all-agents-btn"' in html
+    assert 'title="Rerun all reviewer agents"' in html
+    assert 'class="sidebar-heading agents-heading"' in html
+    assert 'class="agent-heading-actions"' in html
+
+
+def test_render_sidebar_github_sessions_show_manual_curator_button(
+    session_dir: Path,
+    repo: Path,
+):
+    s = sess.load_session(session_dir)
+    s.github = GitHubPR(repo="acme/foo", number=42)
+    files = diffmod.parse_diff(str(repo), s.base_ref, s.topic_ref)
+    html = render.render_page(s, s.id, files, [], head_shifted=False)
+
+    assert 'id="curator-run-btn"' in html
+
+
 def test_render_sidebar_action_shortcuts_use_namespaced_bindings(
     session_dir: Path,
     repo: Path,
@@ -336,6 +542,7 @@ def test_render_global_section_appears_above_files(session_dir: Path, repo: Path
     g_idx = html.index('id="global-comments"')
     g_close = html.index("</section>", g_idx)
     assert "scope concern" in html[g_idx:g_close]
+    assert f'data-reply-to="{g.id}"' not in html[g_idx:g_close]
     # Anchored comment is still in its file thread, not the global section.
     assert "anchored" in html
     assert "anchored" not in html[g_idx:g_close]
@@ -582,6 +789,23 @@ def test_server_post_reply_and_unresolve(session_dir: Path):
         srv.shutdown()
 
 
+def test_server_rejects_reply_to_global_comment(session_dir: Path):
+    srv, session_id, port = _start_server(session_dir)
+    try:
+        _, parent = _post(
+            f"http://127.0.0.1:{port}/{session_id}/api/comments",
+            {"scope": "global", "body": "scope concern", "author": "vera"},
+        )
+        code, data = _post(
+            f"http://127.0.0.1:{port}/{session_id}/api/comments",
+            {"reply_to": parent["id"], "body": "agreed", "author": "felix"},
+        )
+        assert code == 400
+        assert data["error"] == "replies to global comments are not supported"
+    finally:
+        srv.shutdown()
+
+
 def test_server_post_reply_unknown_parent_returns_404(session_dir: Path):
     srv, session_id, port = _start_server(session_dir)
     try:
@@ -663,6 +887,93 @@ def test_server_notes_endpoint_and_render(session_dir: Path):
         assert '<span class="ts mono">2020-01-01T00:00:00+00:00</span>' not in text
         assert "Test Execution" in text
         assert "llvm-lit" in text
+    finally:
+        srv.shutdown()
+
+
+def test_server_curator_launch_endpoint_returns_updated_agents(session_dir: Path):
+    def fake_launch_curator(session_path):
+        s = sess.load_session(session_path)
+        s.agents.append(AgentConfig(
+            name="Curator",
+            model="m",
+            persona="curator.md",
+            role=AgentRole.CURATOR.value,
+            runner="cursor",
+        ))
+        sess.save_session(session_path, s)
+        return [{"name": "Curator", "supervisor_pid": 2468}]
+
+    srv, session_id, port = _start_server(session_dir)
+    try:
+        with patch("peanut_review.web.app.launch.launch_curator",
+                   side_effect=fake_launch_curator):
+            code, data = _post(
+                f"http://127.0.0.1:{port}/{session_id}/api/curator/launch",
+                {},
+            )
+        assert code == 202
+        assert data["results"][0]["name"] == "Curator"
+        curator = next(agent for agent in data["agents"] if agent["name"] == "Curator")
+        assert curator["role"] == "curator"
+    finally:
+        srv.shutdown()
+
+
+def test_server_agents_rerun_endpoint_targets_reviewer_agents_only(session_dir: Path):
+    s = sess.load_session(session_dir)
+    s.agents.append(AgentConfig(
+        name="Curator",
+        model="m",
+        persona="curator.md",
+        role=AgentRole.CURATOR.value,
+        runner="cursor",
+    ))
+    sess.save_session(session_dir, s)
+
+    def fake_rerun_agents(session_path, **kwargs):
+        assert session_path == session_dir
+        assert kwargs["agent_names"] == ["felix"]
+        stored = sess.load_session(session_path)
+        stored.agents[0].status = "running"
+        sess.save_session(session_path, stored)
+        return [{"name": "felix", "supervisor_pid": 1357}]
+
+    srv, session_id, port = _start_server(session_dir)
+    try:
+        with patch("peanut_review.web.app.launch.rerun_agents",
+                   side_effect=fake_rerun_agents):
+            code, data = _post(
+                f"http://127.0.0.1:{port}/{session_id}/api/agents/rerun",
+                {},
+            )
+        assert code == 202
+        assert data["results"][0]["name"] == "felix"
+        assert {agent["name"]: agent["role"] for agent in data["agents"]} == {
+            "felix": "reviewer",
+            "Curator": "curator",
+        }
+    finally:
+        srv.shutdown()
+
+
+def test_server_diff_fold_endpoint_returns_bounded_slice(tmp_path: Path):
+    repo = _dense_large_file_repo(tmp_path, line_count=3000, change_every=5)
+    session_dir = _session_for_repo(tmp_path, repo)
+    srv, session_id, port = _start_server(session_dir)
+    try:
+        path = urllib.parse.quote("dense.py")
+        code, raw = _get(
+            f"http://127.0.0.1:{port}/{session_id}/api/diff/fold"
+            f"?file={path}&start=320&end=325"
+        )
+        assert code == 200
+        data = json.loads(raw)
+        assert data["file"] == "dense.py"
+        assert data["start"] == 320
+        assert data["end"] == 325
+        assert len(data["lines"]) == 5
+        assert {"kind", "old_lineno", "new_lineno", "content"} <= set(data["lines"][0])
     finally:
         srv.shutdown()
 
@@ -816,6 +1127,50 @@ def test_server_gh_preview_defaults_humans_on_agents_off(session_dir: Path):
         assert items[agent_comment.id]["default_included"] is False
         assert items[human_comment.id]["is_agent"] is False
         assert items[human_comment.id]["default_included"] is True
+    finally:
+        srv.shutdown()
+
+
+def test_server_gh_preview_marks_unreviewable_anchor_for_global_promotion(
+    tmp_path: Path,
+):
+    repo = _long_repo(tmp_path, line_count=160, changed_line=120)
+    sd = tmp_path / "sess"
+    sess.create_session(
+        workspace=str(repo),
+        base_ref="main~1",
+        topic_ref="main",
+        agents=[{"name": "felix", "model": "m", "persona": "felix.md"}],
+        session_dir=str(sd),
+    )
+    _mark_github_backed(sd)
+    parent = Comment(
+        author="jakub", file="long.py", line=5, body="far from hunk",
+        severity="warning",
+    )
+    reply = Comment(
+        author="jakub", file="long.py", line=5, body="reply",
+        reply_to=parent.id,
+    )
+    store.append_comment(sd, parent)
+    store.append_comment(sd, reply)
+
+    srv, session_id, port = _start_server(sd)
+    try:
+        code, raw = _get(f"http://127.0.0.1:{port}/{session_id}/api/gh/preview")
+        assert code == 200
+        data = json.loads(raw)
+        item = data["new_top"][0]
+        reply_item = data["new_replies"][0]
+
+        assert data["promoted"] == 1
+        assert item["id"] == parent.id
+        assert item["promoted_to_global"] is True
+        assert item["original_ref"] == "long.py:5"
+        assert item["ref"] == "global"
+        assert item["body"].startswith("Original anchor: `long.py:5`")
+        assert reply_item["parent_promoted_to_global"] is True
+        assert reply_item["orphaned"] is True
     finally:
         srv.shutdown()
 
@@ -1123,6 +1478,11 @@ def test_amend_auto_migrate(session_dir: Path, repo: Path):
         _, raw = _get(f"http://127.0.0.1:{port}/{session_id}/api/session")
         data = json.loads(raw)
         assert data["head_shifted"] is True
+        new_head = _git(repo, "rev-parse", "HEAD").strip()
+        migrated = sess.load_session(session_dir)
+        assert migrated.current_head == new_head
+        assert migrated.topic_ref == new_head
+        assert migrated.diff_commands == [f"git diff {migrated.base_ref}...{new_head}"]
 
         # Comment should now be stale
         comments = store.read_all_comments(session_dir)
@@ -1502,6 +1862,16 @@ def test_client_comment_renderer_includes_relative_time():
     assert "function commentTime" in block
     assert '"comment-time"' in block
     assert "${commentTime(c)}" in block
+
+
+def test_client_comment_renderer_hides_global_reply_action():
+    text = (Path(web_app.__file__).parent / "assets" / "app.js").read_text()
+    start = text.index("function renderThreadActions")
+    end = text.index("const THREAD_COLLAPSE_KEY", start)
+    block = text[start:end]
+
+    assert "allowReply" in block
+    assert 'parent.file !== ""' in block
 
 
 def test_client_comment_renderer_supports_thread_collapse():

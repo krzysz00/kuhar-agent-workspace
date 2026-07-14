@@ -10,6 +10,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import tempfile
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
@@ -445,6 +446,10 @@ def test_init_with_gh_pr_stamps_metadata_and_uses_pr_shas(gh_shim, tmp_path):
         "--session", sd, "init",
         "--workspace", ws,
         "--gh-pr", "acme/foo#42",
+        "--agents", json.dumps([
+            {"name": "vera", "model": "opus", "persona": "vera.md"},
+            {"name": "Curator", "model": "gpt-5.5-high", "role": "curator"},
+        ]),
     ])
     assert rc == 0
 
@@ -458,6 +463,9 @@ def test_init_with_gh_pr_stamps_metadata_and_uses_pr_shas(gh_shim, tmp_path):
     assert s.github.head_ref_name == "feature/add-it"
     assert s.base_ref == base   # defaulted from PR
     assert s.topic_ref == head  # defaulted from PR
+    assert [(a.name, a.model, a.role) for a in sess.curator_agents(s)] == [
+        ("Curator", "gpt-5.5-high", "curator"),
+    ]
 
 
 def test_init_id_overrides_auto_default(gh_shim, tmp_path):
@@ -482,6 +490,10 @@ def test_init_id_overrides_auto_default(gh_shim, tmp_path):
         "--session", sd, "init",
         "--workspace", ws,
         "--gh-pr", "acme/foo#42",
+        "--agents", json.dumps([
+            {"name": "vera", "model": "opus", "persona": "vera.md"},
+            {"name": "Curator", "model": "gpt-5.5-high", "role": "curator"},
+        ]),
         "--id", "my-review",
     ])
     assert rc == 0
@@ -523,6 +535,10 @@ def test_start_from_project_config_with_bare_pr_number(gh_shim, tmp_path):
         "agents": [
             {"name": "vera", "model": "opus", "persona": "vera.md"},
             {"name": "irene", "model": "gpt", "persona": "irene.md", "runner": "opencode"},
+            {
+                "name": "Curator", "model": "gpt-5.5-high",
+                "role": "curator",
+            },
         ],
     }))
 
@@ -570,13 +586,18 @@ def test_start_from_project_config_with_bare_pr_number(gh_shim, tmp_path):
 
     sd = review_root / "foo-feature-add-it"
     s = sess.load_session(sd)
-    assert s.workspace == ws
+    assert s.workspace == str(tmp_path)
+    assert s.repo_relative == "ws"
+    assert sess.repo_path(s) == ws
     assert s.timeout == 77
     assert s.github is not None
     assert s.github.repo == "acme/foo"
     assert s.github.number == 42
-    assert [a.name for a in s.agents] == ["vera", "irene"]
+    assert [a.name for a in sess.reviewer_agents(s)] == ["vera", "irene"]
     assert s.agents[1].runner == "opencode"
+    assert [(a.name, a.role, a.model, a.runner) for a in sess.curator_agents(s)] == [
+        ("Curator", "curator", "gpt-5.5-high", "cursor"),
+    ]
 
     comments = {c.external_id: c for c in store.read_all_comments(sd)}
     assert set(comments) == {"100", "200"}
@@ -585,6 +606,26 @@ def test_start_from_project_config_with_bare_pr_number(gh_shim, tmp_path):
     assert comments["100"].line == 2
     assert comments["200"].author == "gh:ghost"
     assert comments["200"].file == ""
+
+
+def test_start_requires_curator_agent_in_project_config(tmp_path):
+    _stage_workspace(tmp_path)
+    config_path = tmp_path / ".peanut-review.json"
+    config_path.write_text(json.dumps({
+        "reviewRoot": str(tmp_path / "reviews"),
+        "workspaceRoot": str(tmp_path),
+        "repoRelative": "ws",
+        "agents": [
+            {"name": "vera", "model": "opus", "persona": "vera.md"},
+        ],
+    }))
+
+    err = io.StringIO()
+    with redirect_stderr(err):
+        rc = main(["start", "42", "--config", str(config_path), "--no-launch"])
+
+    assert rc == 1
+    assert "curator agent is not configured" in err.getvalue()
 
 
 # ---------------- gh-push ----------------
@@ -603,6 +644,50 @@ def _make_gh_session(tmp_path: Path) -> str:
         github=models.GitHubPR(
             repo="acme/foo", number=42, url="u",
             head_sha="abc", base_sha="def", title="t",
+        ),
+    )
+    sess.save_session(sd, s)
+    return str(sd)
+
+
+def _make_gh_git_session(tmp_path: Path) -> str:
+    """Build a GitHub-backed session whose diff has a narrow review hunk."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+    src = repo / "src"
+    src.mkdir()
+    lines = [f"value_{i:02d} = {i}\n" for i in range(1, 81)]
+    (src / "x.py").write_text("".join(lines))
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+    base = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    lines[39] = "value_40 = 'changed'\n"
+    (src / "x.py").write_text("".join(lines))
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-am", "topic"], check=True)
+    head = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+
+    sd = tmp_path / "sess"
+    (sd / "comments").mkdir(parents=True)
+    (sd / "signals").mkdir()
+    s = models.Session(
+        id="acme-foo-pr-42",
+        workspace=str(repo),
+        base_ref=base,
+        topic_ref=head,
+        original_head=head,
+        current_head=head,
+        github=models.GitHubPR(
+            repo="acme/foo", number=42, url="u",
+            head_sha=head, base_sha=base, title="t",
         ),
     )
     sess.save_session(sd, s)
@@ -731,6 +816,36 @@ def test_gh_push_concats_global_comments_and_deletes_individuals(gh_shim, tmp_pa
     comments = store.read_all_comments(sd)
     assert [c.deleted for c in comments] == [True, True]
     assert gh_push.plan_push(comments).total == 0
+
+
+def test_gh_push_promotes_unreviewable_anchor_to_global(gh_shim, tmp_path):
+    sd = _make_gh_git_session(tmp_path)
+    store.append_comment(sd, models.Comment(
+        author="vera", file="src/x.py", line=1, body="far from the hunk",
+        severity="warning",
+    ))
+
+    gh_shim.set_fixtures([_review_post_fixture(300)])
+
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = main(["--session", sd, "gh-push"])
+    assert rc == 0
+    assert "promoted 1 to global" in out.getvalue()
+
+    [call] = gh_shim.calls()
+    payload = json.loads(call["stdin"])
+    assert payload == {
+        "event": "COMMENT",
+        "body": "Original anchor: `src/x.py:1`\n\nfar from the hunk",
+    }
+
+    [stored] = store.read_all_comments(sd)
+    assert stored.deleted is True
+    assert stored.deleted_by == "github-push"
+    assert stored.external_source == "github-review"
+    assert stored.external_id == "300"
+    assert stored.external_synced_body == payload["body"]
 
 
 def test_gh_push_global_approval_posts_pr_review(gh_shim, tmp_path):
@@ -961,6 +1076,30 @@ def test_gh_push_pushes_reply_after_parent(gh_shim, tmp_path):
     assert by_body["parent"].external_id == "200"
     assert by_body["reply"].external_id == "201"
     assert by_body["reply"].external_in_reply_to == "200"
+
+
+def test_gh_push_rejects_legacy_global_reply_without_api_call(gh_shim, tmp_path):
+    sd = _make_gh_session(tmp_path)
+    parent = models.Comment(
+        author="gh:octocat", file="", line=0, body="global",
+        external_source="github", external_id="100",
+        external_synced_body="global",
+    )
+    reply = models.Comment(
+        author="felix", file="", line=0, body="reply",
+        reply_to=parent.id,
+    )
+    plan = gh_push.plan_push([parent, reply])
+    session = sess.load_session(sd)
+    assert session.github is not None
+
+    result = gh_push.execute_push(sd, session, session.github, plan)
+
+    assert result.failed == 1
+    assert result.items[0].error == (
+        "GitHub does not support replies to global comments"
+    )
+    assert gh_shim.calls() == []
 
 
 def test_gh_push_skips_orphan_replies(gh_shim, tmp_path):
