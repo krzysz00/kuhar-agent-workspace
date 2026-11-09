@@ -3,17 +3,22 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from peanut_review import launch
-from peanut_review.models import AgentConfig
+from peanut_review.models import AgentConfig, AgentRole, Comment, GitHubPR
 
 
 def _mock_git(workspace, *args):
-    if args == ("rev-parse", "HEAD"):
+    if args == ("rev-parse", "--path-format=absolute", "--git-common-dir"):
+        return "/tmp/fakerepo/.git"
+    if args[:2] == ("rev-parse", "--verify"):
         return "abc123def456"
     if args[0] == "diff" and "--stat" in args:
         return "+1 -0 1 file"
@@ -37,14 +42,21 @@ def _default_workspace() -> str:
     return str(workspace)
 
 
-def _make_session_dir(agents: list[AgentConfig], workspace: str | None = None) -> str:
+def _make_session_dir(
+    agents: list[AgentConfig],
+    workspace: str | None = None,
+    repo_relative: str | None = None,
+    ssh_targets: dict | None = None,
+) -> str:
     from peanut_review.session import create_session
 
     sd = os.path.join(tempfile.mkdtemp(prefix="pr-launch-"), "session")
     with patch("peanut_review.session._run_git", side_effect=_mock_git):
         create_session(
             workspace=workspace or _default_workspace(),
+            repo_relative=repo_relative,
             agents=[a.to_dict() for a in agents],
+            ssh_targets=ssh_targets,
             session_dir=sd,
         )
     return sd
@@ -108,6 +120,95 @@ def test_launch_dry_run_cursor_agent_cmd():
     assert "--model" in cmd and "opus-4.6-thinking" in cmd
 
 
+def test_launch_refuses_github_session_from_different_checkout(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_cursor_config(repo)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+    (repo / "x.py").write_text("x = 1\n")
+    subprocess.run(["git", "-C", str(repo), "add", "x.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+    base = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True,
+    ).strip()
+    (repo / "x.py").write_text("x = 2\n")
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-am", "review"], check=True)
+    review_head = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True,
+    ).strip()
+
+    sd = str(tmp_path / "session")
+    from peanut_review.session import create_session
+    create_session(
+        workspace=str(repo),
+        base_ref=base,
+        topic_ref=review_head,
+        agents=[AgentConfig(
+            name="vera", model="opus", persona="vera.md",
+        ).to_dict()],
+        session_dir=sd,
+        github=GitHubPR(
+            repo="acme/foo", number=42,
+            head_sha=review_head, base_sha=base,
+        ),
+    )
+    (repo / "x.py").write_text("x = 3\n")
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-am", "other"], check=True)
+
+    with pytest.raises(ValueError, match="does not match pinned review head"):
+        launch.launch_agents(sd, dry_run=True)
+
+
+def test_launch_refuses_github_session_when_workspace_head_is_unavailable():
+    sd = _make_session_dir([
+        AgentConfig(name="vera", model="opus", persona="vera.md"),
+    ])
+    from peanut_review import session as sess
+    session = sess.load_session(sd)
+    session.github = GitHubPR(repo="acme/foo", number=42)
+    sess.save_session(sd, session)
+
+    with pytest.raises(ValueError, match="cannot resolve workspace HEAD"):
+        launch.launch_agents(sd, dry_run=True)
+
+
+def test_launch_uses_workspace_root_for_cursor_and_nested_repo_for_prompt(tmp_path):
+    workspace = tmp_path / "review"
+    repo = workspace / "rocm-systems"
+    repo.mkdir(parents=True)
+    (workspace / "build").mkdir()
+    (workspace / "build" / "compile_commands.json").write_text("[]\n")
+    (workspace / "build-clang-asan").mkdir()
+    (workspace / "venv").mkdir()
+    (workspace / "compile_commands.json").symlink_to(workspace / "build" / "compile_commands.json")
+    _write_cursor_config(workspace)
+    sd = _make_session_dir(
+        [AgentConfig(name="vera", model="opus", persona="vera.md")],
+        workspace=str(workspace),
+        repo_relative="rocm-systems",
+    )
+
+    results = launch.launch_agents(sd, dry_run=True)
+
+    cmd = results[0]["cmd"]
+    assert cmd[cmd.index("--workspace") + 1] == str(workspace)
+    supervisor_cmd = results[0]["supervisor_cmd"]
+    assert supervisor_cmd[supervisor_cmd.index("--cwd") + 1] == str(workspace)
+    rendered = (Path(sd) / "prompts" / "vera.md").read_text()
+    assert f"Workspace: `{workspace}`" in rendered
+    assert f"Repository: `{repo}`" in rendered
+    assert "Workspace is the runner/build/tool root" in rendered
+    assert "Do not assume `build/` is inside Repository" in rendered
+    assert f"- `{workspace / 'build'}`" in rendered
+    assert f"- `{workspace / 'build-clang-asan'}`" in rendered
+    assert f"Compilation database: `{workspace / 'compile_commands.json'}` -> `{workspace / 'build' / 'compile_commands.json'}`" in rendered
+    assert f"Python venv: `{workspace / 'venv'}`" in rendered
+    assert f"git -C {repo} diff" in rendered
+    assert f"cd {repo}" not in rendered
+
+
 def test_launch_dry_run_opencode_agent_cmd():
     sd = _make_session_dir([
         AgentConfig(
@@ -136,6 +237,81 @@ def test_launch_dry_run_mixed_runners():
     assert results[1]["cmd"][0].endswith("opencode-agent-task.sh")
 
 
+def test_launch_dry_run_mixed_local_and_ssh_uses_remote_prompt_paths(tmp_path):
+    workspace = _workspace_with_cursor_config(tmp_path)
+    target = {
+        "host": "reviewer@docs-host",
+        "controlPath": "/tmp/peanut docs.sock",
+        "gatewayUrl": "http://127.0.0.1:27184",
+        "workspaceRoot": "/srv/review workspace",
+        "repoRelative": "source repo",
+        "buildRoots": ["/srv/review workspace/build"],
+        "peanutReviewBin": "/opt/peanut review/bin/peanut-review",
+        "runtimeRoot": "/srv/review workspace/runtime",
+    }
+    sd = _make_session_dir([
+        AgentConfig(name="local", model="gpt", persona="vera.md", runner="codex"),
+        AgentConfig(
+            name="remote", model="gpt", persona="felix.md", runner="codex",
+            ssh_target="docs-host",
+        ),
+    ], workspace=workspace, ssh_targets={"docs-host": target})
+    (Path(sd) / "personas").mkdir(exist_ok=True)
+    (Path(sd) / "personas" / "vera.md").write_text("local")
+    (Path(sd) / "personas" / "felix.md").write_text("remote")
+
+    results = launch.launch_agents(sd, dry_run=True)
+
+    assert results[0]["cmd"][0].endswith("codex-agent-task.sh")
+    assert results[1]["transport"] == "ssh"
+    assert results[1]["ssh_target"] == "docs-host"
+    assert "ssh-transport" in results[1]["cmd"]
+    assert not (Path(sd) / "runtime" / "gateway").exists()
+    local_prompt = (Path(sd) / "prompts" / "local.md").read_text()
+    remote_prompt = (Path(sd) / "prompts" / "remote.md").read_text()
+    assert f"--session {sd}" in local_prompt
+    assert "--session peanut://" in remote_prompt
+    assert "Workspace: `/srv/review workspace`" in remote_prompt
+    assert "Repository: `'/srv/review workspace/source repo'`" in remote_prompt
+    assert "Configured remote build roots:" in remote_prompt
+    assert "'/srv/review workspace/runtime/" in remote_prompt
+    assert "'/opt/peanut review/bin/peanut-review'" in remote_prompt
+    assert "PEANUT_REVIEW_GATEWAY_TOKEN" not in remote_prompt
+
+
+def test_launch_completes_all_remote_preflights_before_starting_any_agent(tmp_path):
+    workspace = _workspace_with_cursor_config(tmp_path)
+    target = {
+        "host": "reviewer@host",
+        "controlPath": "/tmp/master.sock",
+        "gatewayUrl": "http://127.0.0.1:27184",
+        "workspaceRoot": "/srv/project",
+        "repoRelative": ".",
+        "buildRoots": ["/srv/project/build"],
+    }
+    sd = _make_session_dir([
+        AgentConfig(
+            name="one", model="gpt", persona="vera.md", runner="codex",
+            ssh_target="docs-host",
+        ),
+        AgentConfig(
+            name="two", model="gpt", persona="felix.md", runner="codex",
+            ssh_target="docs-host",
+        ),
+    ], workspace=workspace, ssh_targets={"docs-host": target})
+
+    with patch(
+        "peanut_review.ssh_transport.preflight_agent",
+        side_effect=[{"ok": True}, ValueError("remote build missing")],
+    ) as preflight, patch("peanut_review.launch.subprocess.Popen") as popen:
+        with pytest.raises(ValueError, match="remote build missing"):
+            launch.launch_agents(sd)
+
+    assert preflight.call_count == 2
+    popen.assert_not_called()
+    assert not (Path(sd) / "runtime" / "gateway" / "capabilities").exists()
+
+
 def test_launch_dry_run_can_target_single_agent():
     sd = _make_session_dir([
         AgentConfig(name="vera", model="opus-4.6-thinking", persona="vera.md"),
@@ -153,6 +329,96 @@ def test_launch_dry_run_can_target_single_agent():
     assert not (Path(sd) / "prompts" / "vera.md").exists()
 
 
+def test_launch_default_excludes_curator_and_curate_uses_dedicated_prompt(tmp_path):
+    workspace = _workspace_with_cursor_config(tmp_path)
+    sd = _make_session_dir([
+        AgentConfig(name="vera", model="opus", persona="vera.md"),
+        AgentConfig(
+            name="Curator", model="opus",
+            role=AgentRole.CURATOR.value,
+        ),
+    ], workspace=workspace)
+
+    reviewer_results = launch.launch_agents(sd, dry_run=True)
+    curator_results = launch.launch_curator(sd, dry_run=True)
+
+    assert [r["name"] for r in reviewer_results] == ["vera"]
+    assert [r["name"] for r in curator_results] == ["Curator"]
+    reviewer_prompt = (Path(sd) / "prompts" / "vera.md").read_text()
+    curator_prompt = (Path(sd) / "prompts" / "Curator.md").read_text()
+    assert "Read your persona" in reviewer_prompt
+    assert "comment curator" in curator_prompt
+    completion_contract = (
+        "This signal and your process outcome are the authoritative "
+        "completion status"
+    )
+    assert completion_contract in reviewer_prompt
+    assert completion_contract in curator_prompt
+    assert "Reviewer agents: `vera`" in curator_prompt
+    assert "Optimize for a small, high-signal final comment set" in curator_prompt
+    assert "collapse similar low-level findings into one concise global comment" in curator_prompt
+    assert "visible, resolved, deleted, and imported GitHub comments" in curator_prompt
+    assert "Prefer existing threads over new duplicate comments" in curator_prompt
+    assert "add-comment --reply-to <comment-id>" in curator_prompt
+    assert "unresolve <comment-id>" in curator_prompt
+    assert "use one global comment when the global framing is more useful" in curator_prompt
+    assert "global comment ID with `--reply-to`" in curator_prompt
+    assert curator_prompt.index("Optimize for a small") < curator_prompt.index(
+        "Classify reviewer comments as"
+    )
+    assert "friendly, conversational reviewer voice" in curator_prompt
+    assert "choose the opening shape from the finding's confidence" in curator_prompt
+    assert "We should ..." in curator_prompt
+    assert "Should we ..." in curator_prompt
+    assert "The risk here is that ..." in curator_prompt
+    assert "We shouldn't be ..." in curator_prompt
+    assert "I don't understand why ..." in curator_prompt
+    assert "It's not obvious to me why ..." in curator_prompt
+    assert "If I am reading this right, ..." in curator_prompt
+    assert "I'm not sure if this works when ..." in curator_prompt
+    assert "Can we make this ...?" in curator_prompt
+    assert "do not use question form as the default" in curator_prompt
+    assert "Record one concise summary in Agent reports" in curator_prompt
+    assert "deletion ledger with one entry" in curator_prompt
+    assert "including comments deleted after" in curator_prompt
+    assert "its original `file:line` anchor (or `global`)" in curator_prompt
+    assert "Do not group multiple deleted comments" in curator_prompt
+    assert "Deleted comments: none" in curator_prompt
+    assert "note --message" in curator_prompt
+    assert "Read your persona" not in curator_prompt
+    assert "peanut-review ask" not in reviewer_prompt
+    assert "babysitting channel" not in reviewer_prompt
+
+
+def test_launch_curator_requires_configured_curator():
+    sd = _make_session_dir([
+        AgentConfig(name="vera", model="opus", persona="vera.md"),
+    ])
+
+    with pytest.raises(ValueError, match="curator agent is not configured"):
+        launch.launch_curator(sd, dry_run=True)
+
+
+def test_launch_curator_clears_stale_auto_launch_marker(tmp_path):
+    workspace = _workspace_with_cursor_config(tmp_path)
+    sd = _make_session_dir([
+        AgentConfig(name="vera", model="opus", persona="vera.md"),
+        AgentConfig(
+            name="Curator", model="opus",
+            role=AgentRole.CURATOR.value,
+        ),
+    ], workspace=workspace)
+    marker = Path(sd) / "signals" / "Curator.auto-launching"
+    marker.parent.mkdir(exist_ok=True)
+    marker.write_text("stale\n")
+
+    with patch("peanut_review.launch.subprocess.Popen", return_value=DummyProc()):
+        results = launch.launch_curator(sd)
+
+    assert [r["name"] for r in results] == ["Curator"]
+    assert not marker.exists()
+
+
 def test_launch_rejects_unknown_target_agent():
     sd = _make_session_dir([
         AgentConfig(name="vera", model="opus-4.6-thinking", persona="vera.md"),
@@ -167,20 +433,109 @@ def test_launch_rejects_unknown_target_agent():
         raise AssertionError("expected ValueError for unknown agent")
 
 
+def test_reviewer_launch_records_curation_baseline_and_resets_curator(tmp_path):
+    from peanut_review import polling, runtime, session as sess, store
+
+    workspace = _workspace_with_cursor_config(tmp_path)
+    sd = _make_session_dir([
+        AgentConfig(name="vera", model="opus", persona="vera.md"),
+        AgentConfig(
+            name="Curator", model="opus",
+            role=AgentRole.CURATOR.value,
+        ),
+    ], workspace=workspace)
+    existing = Comment(author="gh:alice", body="already imported")
+    store.append_comment(sd, existing)
+    polling.write_signal(sd, "Curator", "round-done")
+    (Path(sd) / "signals" / "Curator.auto-launching").write_text("old\n")
+    runtime.update_agent_meta(sd, "Curator", {
+        "process_state": "exited",
+        "exit_code": 0,
+        "pid": 999999,
+    })
+
+    with patch("peanut_review.launch.subprocess.Popen", return_value=DummyProc()):
+        results = launch.launch_agents(sd)
+
+    assert [r["name"] for r in results] == ["vera"]
+    stored = sess.load_session(sd)
+    assert stored.curation_since_comment_id == existing.id
+    assert not (Path(sd) / "signals" / "Curator.round-done").exists()
+    assert not (Path(sd) / "signals" / "Curator.auto-launching").exists()
+    curator_agent = next(a for a in stored.agents if a.name == "Curator")
+    assert curator_agent.status == "pending"
+    assert curator_agent.pid is None
+
+
 def test_launch_dry_run_codex_agent_cmd():
     sd = _make_session_dir([
-        AgentConfig(name="cleo", model="gpt-5.5", persona="vera.md", runner="codex"),
+        AgentConfig(
+            name="cleo",
+            model="gpt-5.5",
+            reasoning_effort="high",
+            persona="vera.md",
+            runner="codex",
+        ),
     ])
     results = launch.launch_agents(sd, dry_run=True)
     assert len(results) == 1
     cmd = results[0]["cmd"]
     assert cmd[0].endswith("codex-agent-task.sh")
     assert "--model" in cmd and "gpt-5.5" in cmd
+    assert "--reasoning-effort" in cmd and "high" in cmd
+    assert "--no-fast-mode" in cmd
     # Codex needs unrestricted writes because workspace-write + --add-dir is
     # still read-only for the out-of-workspace session dir in current Codex.
     assert "--sandbox" in cmd and "danger-full-access" in cmd
     assert "--add-dir" in cmd
     assert sd in cmd
+
+
+def test_launch_dry_run_can_enable_codex_fast_mode():
+    sd = _make_session_dir([
+        AgentConfig(
+            name="cleo",
+            model="gpt-5.5",
+            fast_mode=True,
+            persona="vera.md",
+            runner="codex",
+        ),
+    ])
+
+    [result] = launch.launch_agents(sd, dry_run=True)
+
+    assert "--fast-mode" in result["cmd"]
+    assert "--no-fast-mode" not in result["cmd"]
+
+
+@pytest.mark.parametrize(
+    ("wrapper_flag", "codex_flag"),
+    [
+        ("--fast-mode", "--enable fast_mode"),
+        ("--no-fast-mode", "--disable fast_mode"),
+        (None, "--disable fast_mode"),
+    ],
+)
+def test_codex_runner_translates_fast_mode_flags(tmp_path, wrapper_flag, codex_flag):
+    script = launch._find_launcher_script("codex")
+    fast_mode_args = [wrapper_flag] if wrapper_flag else []
+
+    proc = subprocess.run(
+        [
+            script,
+            "--workspace", str(tmp_path),
+            "--output-dir", str(tmp_path / "log"),
+            "--name", "vera",
+            *fast_mode_args,
+            "--prompt", "review this",
+            "--dry-run",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert codex_flag in proc.stderr
 
 
 def test_launch_uses_python_supervisor_for_non_dry_run():
@@ -321,6 +676,50 @@ def test_cursor_agents_get_isolated_homes_without_mcp_config(tmp_path):
     assert not (Path(results[1]["cursor_home"]) / ".cursor" / "mcp.json").exists()
 
 
+@pytest.mark.parametrize("custom_codex_home", [False, True])
+def test_cursor_prompt_inherits_live_global_guidance(tmp_path, monkeypatch, custom_codex_home):
+    user_home = tmp_path / "user home"
+    user_home.mkdir()
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_dir = user_home / ".codex"
+    if custom_codex_home:
+        codex_dir = tmp_path / "custom codex"
+        monkeypatch.setenv("CODEX_HOME", str(codex_dir))
+    codex_dir.mkdir()
+    guidance = codex_dir / "AGENTS.md"
+    guidance.write_text("Use ~/projects/isa-manuals for ISA references.\n")
+    sd = _make_session_dir([
+        AgentConfig(name="lisa", model="test", runner="cursor"),
+        AgentConfig(name="vera", model="test", runner="codex"),
+        AgentConfig(name="Curator", model="test", runner="cursor", role="curator"),
+    ])
+
+    prompts = launch.render_all_prompts(sd, agent_names=["lisa", "vera", "Curator"])
+    expected_path = str(user_home / "projects" / "isa-manuals")
+    for name in ["lisa", "Curator"]:
+        text = prompts[name].read_text()
+        assert str(guidance) in text
+        assert expected_path in text
+        assert "~/projects/isa-manuals" not in text
+    assert "# Shared user instructions" not in prompts["vera"].read_text()
+
+    guidance.write_text("Use ~/llvm/main for LLVM references.\n")
+    text = launch.render_all_prompts(sd, agent_names=["lisa"])["lisa"].read_text()
+    assert str(user_home / "llvm" / "main") in text
+    assert expected_path not in text
+
+
+@pytest.mark.parametrize("contents", [None, "", " \n"])
+def test_cursor_global_guidance_is_optional(tmp_path, monkeypatch, contents):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    if contents is not None:
+        (tmp_path / ".codex").mkdir()
+        (tmp_path / ".codex" / "AGENTS.md").write_text(contents)
+    assert launch._cursor_global_instructions() == ""
+
+
 def test_cursor_launch_fails_when_cli_json_missing(tmp_path):
     workspace = str(tmp_path / "repo")
     Path(workspace).mkdir()
@@ -431,6 +830,56 @@ def test_agents_use_cli_prompt_template():
     # CLI template self-identifies by instructing the agent to execute shell commands.
     assert "Shell tool" in cursor_rendered
     assert "Shell tool" in rendered
+    assert "# Pull request context" not in rendered
+    assert "${PR_CONTEXT}" not in rendered
+
+
+@pytest.mark.parametrize("body", [None, "", "## Intent\n\nKeep `$PATH`, ${SESSION}, and ✓.\n"])
+def test_pr_context_reaches_all_reviewers_and_curator(tmp_path, body):
+    from peanut_review import session as sess
+
+    agents = [
+        AgentConfig(name=runner, model="test", runner=runner, persona="vera.md")
+        for runner in ["cursor", "opencode", "codex"]
+    ] + [
+        AgentConfig(name="Curator", model="test", role="curator"),
+        AgentConfig(name="remote", model="test", runner="codex", ssh_target="host"),
+    ]
+    sd = tmp_path / "session"
+    with patch("peanut_review.session._run_git", side_effect=_mock_git):
+        sess.create_session(
+            workspace=str(tmp_path),
+            agents=[agent.to_dict() for agent in agents],
+            ssh_targets={"host": {
+                "host": "reviewer@host",
+                "controlPath": "/tmp/peanut-review-context.sock",
+                "gatewayUrl": "http://127.0.0.1:27184",
+                "workspaceRoot": "/srv/review",
+                "repoRelative": "repo",
+                "buildRoots": ["/srv/review/build"],
+                "peanutReviewBin": "/opt/peanut-review/bin/peanut-review",
+                "runtimeRoot": "/srv/runtime",
+            }},
+            session_dir=str(sd),
+            github=GitHubPR(repo="acme/foo", number=42, title="PR intent", body=body),
+        )
+
+    assert sess.load_session(sd).github.body == body
+    prompts = launch.render_all_prompts(
+        sd, agent_names=[agent.name for agent in agents],
+        remote_launch_ids={"remote": "launch1"},
+    )
+    assert set(prompts) == {agent.name for agent in agents}
+    for prompt in prompts.values():
+        text = prompt.read_text()
+        assert "Title: PR intent" in text
+        assert "URL: https://github.com/acme/foo/pull/42" in text
+        if body is None:
+            assert "PR description was not captured" in text
+        elif body == "":
+            assert "The PR has no description" in text
+        else:
+            assert body in text
 
 
 def test_prompt_uses_persona_filename_independent_of_agent_display_name():

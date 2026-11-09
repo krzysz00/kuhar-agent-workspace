@@ -5,21 +5,27 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from peanut_review.models import AgentConfig, Session, SessionState
+import pytest
+
+from peanut_review import validation
+from peanut_review.models import AgentConfig, Session
 from peanut_review.session import (
     create_session,
     discover_session,
     load_session,
     save_session,
-    transition_state,
     update_agent_status,
 )
 
 
 def _mock_git(workspace, *args):
     """Mock git calls for testing."""
-    if args == ("rev-parse", "HEAD"):
-        return "abc123def456"
+    if args == ("rev-parse", "--path-format=absolute", "--git-common-dir"):
+        return "/tmp/fakerepo/.git"
+    if args[:2] == ("rev-parse", "--verify"):
+        if args[-1] == "main^{commit}":
+            return "base123def456"
+        return "head123def456"
     if args[0] == "diff" and "--stat" in args:
         return "+42 -10 3 files"
     return ""
@@ -40,18 +46,109 @@ def test_create_session(mock_git):
     )
 
     assert s.workspace == "/tmp/fakerepo"
-    assert s.base_ref == "main"
+    assert s.base_ref == "base123def456"
+    assert s.topic_ref == "head123def456"
+    assert s.current_head == "head123def456"
     assert len(s.agents) == 2
     assert s.agents[0].name == "vera"
-    assert s.state == SessionState.INIT.value
 
     # Directory structure created
     assert (Path(session_dir) / "comments").is_dir()
+    assert (Path(session_dir) / "notes").is_dir()
     assert (Path(session_dir) / "signals").is_dir()
-    assert (Path(session_dir) / "messages").is_dir()
+    assert not (Path(session_dir) / "messages").exists()
     assert (Path(session_dir) / "prompts").is_dir()
     assert (Path(session_dir) / "log").is_dir()
     assert (Path(session_dir) / "session.json").is_file()
+
+
+@patch("peanut_review.session._run_git", side_effect=_mock_git)
+def test_session_round_trip_preserves_ssh_targets_and_agent_reference(mock_git, tmp_path):
+    session_dir = tmp_path / "session"
+    session, _ = create_session(
+        workspace="/tmp/repo",
+        agents=[{
+            "name": "remote", "model": "gpt", "persona": "remote.md",
+            "runner": "codex", "sshTarget": "docs-host",
+        }],
+        ssh_targets={
+            "docs-host": {
+                "host": "reviewer@host",
+                "controlPath": "/tmp/review.sock",
+                "gatewayUrl": "http://127.0.0.1:27184",
+                "workspaceRoot": "/srv/project",
+                "repoRelative": "source",
+                "buildRoots": ["/srv/project/build"],
+                "peanutReviewBin": "/opt/peanut-review",
+                "runtimeRoot": "/srv/project/runtime",
+            },
+        },
+        session_dir=str(session_dir),
+    )
+    loaded = load_session(session_dir)
+    assert loaded == session
+    assert loaded.agents[0].ssh_target == "docs-host"
+    target = loaded.ssh_targets["docs-host"]
+    assert target.repo_path() == "/srv/project/source"
+    raw = json.loads((session_dir / "session.json").read_text())
+    assert raw["agents"][0]["sshTarget"] == "docs-host"
+    assert raw["sshTargets"]["docs-host"]["controlPath"] == "/tmp/review.sock"
+
+
+@pytest.mark.parametrize("field, value, expected", [
+    ("host", "-V", "without leading options"),
+    ("controlPath", "relative.sock", "absolute local POSIX path"),
+    ("gatewayUrl", "http://example.com:27184", "IPv4 loopback"),
+])
+@patch("peanut_review.session._run_git", side_effect=_mock_git)
+def test_create_session_validates_direct_ssh_targets(
+    mock_git, tmp_path, field, value, expected,
+):
+    target = {
+        "host": "reviewer@host",
+        "controlPath": "/tmp/review.sock",
+        "gatewayUrl": "http://127.0.0.1:27184",
+        "workspaceRoot": "/srv/project",
+        "repoRelative": "source",
+        "buildRoots": ["/srv/project/build"],
+    }
+    target[field] = value
+    with pytest.raises(validation.ValidationError, match=expected):
+        create_session(
+            workspace="/tmp/repo",
+            agents=[{
+                "name": "remote", "model": "gpt", "persona": "remote.md",
+                "runner": "codex", "sshTarget": "docs-host",
+            }],
+            ssh_targets={"docs-host": target},
+            session_dir=str(tmp_path / "session"),
+        )
+    assert not (tmp_path / "session").exists()
+
+
+@patch("peanut_review.session._run_git", side_effect=_mock_git)
+def test_load_session_revalidates_persisted_ssh_targets(mock_git, tmp_path):
+    session_dir = tmp_path / "session"
+    create_session(
+        workspace="/tmp/repo",
+        ssh_targets={
+            "docs-host": {
+                "host": "reviewer@host",
+                "controlPath": "/tmp/review.sock",
+                "gatewayUrl": "http://127.0.0.1:27184",
+                "workspaceRoot": "/srv/project",
+                "repoRelative": "source",
+                "buildRoots": ["/srv/project/build"],
+            },
+        },
+        session_dir=str(session_dir),
+    )
+    raw = json.loads((session_dir / "session.json").read_text())
+    raw["sshTargets"]["docs-host"]["host"] = "-V"
+    (session_dir / "session.json").write_text(json.dumps(raw))
+
+    with pytest.raises(validation.ValidationError, match="without leading options"):
+        load_session(session_dir)
 
 
 @patch("peanut_review.session._run_git", side_effect=_mock_git)
@@ -62,20 +159,6 @@ def test_load_session(mock_git):
 
     loaded = load_session(session_dir)
     assert loaded.workspace == "/tmp/repo"
-    assert loaded.state == SessionState.INIT.value
-
-
-@patch("peanut_review.session._run_git", side_effect=_mock_git)
-def test_state_transitions(mock_git):
-    sd = tempfile.mkdtemp(prefix="pr-test-")
-    session_dir = os.path.join(sd, "session")
-    create_session(workspace="/tmp/repo", session_dir=session_dir)
-
-    s = transition_state(session_dir, SessionState.ROUND.value)
-    assert s.state == "round"
-
-    s = transition_state(session_dir, SessionState.COMPLETE.value)
-    assert s.state == "complete"
 
 
 @patch("peanut_review.session._run_git", side_effect=_mock_git)
@@ -115,6 +198,28 @@ def test_persona_copying(mock_git):
     assert (Path(session_dir) / "personas" / "felix.md").exists()
 
 
+@patch("peanut_review.session._run_git", side_effect=_mock_git)
+def test_create_session_preserves_nested_repo_relative(mock_git):
+    sd = tempfile.mkdtemp(prefix="pr-test-")
+    session_dir = os.path.join(sd, "session")
+    workspace = Path(sd) / "review"
+
+    s, _ = create_session(
+        workspace=str(workspace),
+        repo_relative="rocm-systems",
+        session_dir=session_dir,
+    )
+
+    assert s.workspace == str(workspace.resolve())
+    assert s.repo_relative == "rocm-systems"
+    assert s.repo_path() == str((workspace / "rocm-systems").resolve())
+    assert load_session(session_dir).repo_relative == "rocm-systems"
+    mock_git.assert_any_call(
+        str((workspace / "rocm-systems").resolve()),
+        "rev-parse", "--verify", "HEAD^{commit}",
+    )
+
+
 def test_discover_session_env():
     with patch.dict(os.environ, {"PEANUT_SESSION": "/tmp/test-session"}):
         assert discover_session() == "/tmp/test-session"
@@ -132,14 +237,24 @@ def test_session_json_roundtrip():
     s = Session(
         id="test-123",
         workspace="/repo",
+        last_github_push_at="2026-08-09T12:00:00+00:00",
         agents=[
             AgentConfig(name="vera", model="opus", persona="vera.md"),
         ],
-        state="round",
     )
     text = s.to_json()
     s2 = Session.from_json(text)
     assert s2.id == "test-123"
     assert len(s2.agents) == 1
     assert s2.agents[0].name == "vera"
-    assert s2.state == "round"
+    assert s2.last_github_push_at == "2026-08-09T12:00:00+00:00"
+
+
+def test_session_json_ignores_legacy_lifecycle_state():
+    raw = json.loads(Session(id="test-123", workspace="/repo").to_json())
+    raw["state"] = "complete"
+
+    loaded = Session.from_json(json.dumps(raw))
+
+    assert not hasattr(loaded, "state")
+    assert "state" not in json.loads(loaded.to_json())

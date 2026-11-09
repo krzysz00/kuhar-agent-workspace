@@ -10,10 +10,11 @@ import io
 import json
 import os
 import stat
+import subprocess
 import tempfile
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -187,7 +188,8 @@ def test_resolve_pr_spec_falls_back_to_repo_view(gh_shim, tmp_path):
 # ---------------- fetch_pr_info ----------------
 
 
-def test_fetch_pr_info_parses_gh_view_output(gh_shim):
+@pytest.mark.parametrize("body", [None, "", "## Intent\n\nPreserve `$PATH` and $(echo test).\n"])
+def test_fetch_pr_info_parses_gh_view_output(gh_shim, body):
     gh_shim.set_fixtures([{
         "match": ["pr", "view", "42"],
         "stdout": json.dumps({
@@ -197,6 +199,7 @@ def test_fetch_pr_info_parses_gh_view_output(gh_shim):
             "headRefName": "feature/add-it",
             "url": "https://github.com/acme/foo/pull/42",
             "title": "Add a feature",
+            "body": body,
         }),
     }])
     info = gh.fetch_pr_info("acme/foo", 42)
@@ -206,6 +209,9 @@ def test_fetch_pr_info_parses_gh_view_output(gh_shim):
     assert info.base_sha == "def456"
     assert info.title == "Add a feature"
     assert info.head_ref_name == "feature/add-it"
+    assert info.body == (body or "")
+    [call] = gh_shim.calls()
+    assert "body" in call["argv"][call["argv"].index("--json") + 1].split(",")
 
 
 def test_fetch_pr_info_propagates_gh_errors(gh_shim):
@@ -445,6 +451,10 @@ def test_init_with_gh_pr_stamps_metadata_and_uses_pr_shas(gh_shim, tmp_path):
         "--session", sd, "init",
         "--workspace", ws,
         "--gh-pr", "acme/foo#42",
+        "--agents", json.dumps([
+            {"name": "vera", "model": "opus", "persona": "vera.md"},
+            {"name": "Curator", "model": "gpt-5.5-high", "role": "curator"},
+        ]),
     ])
     assert rc == 0
 
@@ -458,6 +468,9 @@ def test_init_with_gh_pr_stamps_metadata_and_uses_pr_shas(gh_shim, tmp_path):
     assert s.github.head_ref_name == "feature/add-it"
     assert s.base_ref == base   # defaulted from PR
     assert s.topic_ref == head  # defaulted from PR
+    assert [(a.name, a.model, a.role) for a in sess.curator_agents(s)] == [
+        ("Curator", "gpt-5.5-high", "curator"),
+    ]
 
 
 def test_init_id_overrides_auto_default(gh_shim, tmp_path):
@@ -482,10 +495,234 @@ def test_init_id_overrides_auto_default(gh_shim, tmp_path):
         "--session", sd, "init",
         "--workspace", ws,
         "--gh-pr", "acme/foo#42",
+        "--agents", json.dumps([
+            {"name": "vera", "model": "opus", "persona": "vera.md"},
+            {"name": "Curator", "model": "gpt-5.5-high", "role": "curator"},
+        ]),
         "--id", "my-review",
     ])
     assert rc == 0
     assert sess.load_session(sd).id == "my-review"
+
+
+def test_sync_pr_updates_pinned_snapshot_and_stales_comments(gh_shim, tmp_path):
+    ws = _stage_workspace(tmp_path)
+    base = subprocess.run(
+        ["git", "-C", ws, "rev-parse", "HEAD~"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    old_head = subprocess.run(
+        ["git", "-C", ws, "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    sd = str(tmp_path / "session")
+    sess.create_session(
+        workspace=ws,
+        base_ref=base,
+        topic_ref=old_head,
+        session_dir=sd,
+        github=models.GitHubPR(
+            repo="acme/foo", number=42, url="https://github.com/acme/foo/pull/42",
+            head_sha=old_head, base_sha=base, title="Old title",
+        ),
+    )
+    store.append_comment(sd, models.Comment(
+        author="vera", file="foo.py", line=2, body="check this",
+        head_sha=old_head,
+    ))
+
+    Path(ws, "foo.py").write_text("a\nb\nc\nd\n")
+    subprocess.run(
+        ["git", "-C", ws, "commit", "-q", "-am", "updated topic"],
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+    new_head = subprocess.run(
+        ["git", "-C", ws, "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    gh_shim.set_fixtures([{
+        "match": ["pr", "view", "42"],
+        "stdout": json.dumps({
+            "number": 42,
+            "headRefOid": new_head,
+            "baseRefOid": base,
+            "headRefName": "feature/add-it",
+            "url": "https://github.com/acme/foo/pull/42",
+            "title": "Updated title",
+        }),
+    }])
+
+    rc = main(["--session", sd, "sync-pr"])
+
+    assert rc == 0
+    synced = sess.load_session(sd)
+    assert synced.base_ref == base
+    assert synced.topic_ref == new_head
+    assert synced.current_head == new_head
+    assert synced.diff_commands == [f"git diff {base}...{new_head}"]
+    assert synced.github is not None
+    assert synced.github.head_sha == new_head
+    assert synced.github.title == "Updated title"
+    assert store.read_all_comments(sd)[0].stale is True
+
+
+@pytest.mark.parametrize("pin_existing_snapshot", [False, True])
+def test_start_reuse_syncs_snapshot_before_pulling_comments(
+    tmp_path, pin_existing_snapshot,
+):
+    ws = _stage_workspace(tmp_path)
+    base = subprocess.check_output(
+        ["git", "-C", ws, "rev-parse", "HEAD~"], text=True,
+    ).strip()
+    old_head = subprocess.check_output(
+        ["git", "-C", ws, "rev-parse", "HEAD"], text=True,
+    ).strip()
+    review_root = tmp_path / "reviews"
+    sd = review_root / "foo-feature-add-it"
+    agents = [
+        {"name": "vera", "model": "opus", "persona": "vera.md"},
+        {"name": "Curator", "model": "gpt", "role": "curator"},
+    ]
+    sess.create_session(
+        workspace=str(tmp_path),
+        repo_relative="ws",
+        base_ref=base,
+        topic_ref=old_head,
+        agents=agents,
+        session_dir=str(sd),
+        session_id="foo-feature-add-it",
+        github=models.GitHubPR(
+            repo="acme/foo", number=42,
+            head_sha=old_head, base_sha=base,
+        ),
+        include_curator=True,
+    )
+    stale_session = sess.load_session(sd)
+    stale_session.workspace = str(tmp_path / "previous-review-workspace")
+    stale_session.repo_relative = "old-repo"
+    sess.save_session(sd, stale_session)
+    config = tmp_path / ".peanut-review.json"
+    config.write_text(json.dumps({
+        "reviewRoot": str(review_root),
+        "workspaceRoot": str(tmp_path),
+        "repoRelative": "ws",
+        "agents": agents,
+    }))
+
+    Path(ws, "foo.py").write_text("a\nb\nc\nd\n")
+    subprocess.run(
+        ["git", "-C", ws, "commit", "-q", "-am", "new head"],
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+    new_head = subprocess.check_output(
+        ["git", "-C", ws, "rev-parse", "HEAD"], text=True,
+    ).strip()
+    pr_info = gh.PRInfo(
+        repo="acme/foo", number=42,
+        url="https://github.com/acme/foo/pull/42",
+        title="Add a feature", head_sha=new_head, base_sha=base,
+        head_ref_name="feature/add-it",
+    )
+    pull_result = MagicMock()
+    pull_result.summary.return_value = "Pulled 0 comments."
+
+    with (
+        patch("peanut_review.gh.resolve_pr_spec", return_value=("acme/foo", 42)),
+        patch("peanut_review.gh.fetch_pr_info", return_value=pr_info),
+        patch("peanut_review.gh_pull.pull_comments", return_value=pull_result) as pull,
+    ):
+        args = [
+            "start", "acme/foo#42", "--config", str(config),
+            "--reuse", "--sync", "--no-launch",
+        ]
+        if pin_existing_snapshot:
+            args.extend(["--base", base, "--topic", old_head])
+        rc = main(args)
+
+    assert rc == 0
+    synced = sess.load_session(sd)
+    expected_head = old_head if pin_existing_snapshot else new_head
+    assert synced.current_head == expected_head
+    assert synced.workspace == str(tmp_path)
+    assert synced.repo_relative == "ws"
+    assert synced.github is not None
+    assert synced.github.head_sha == expected_head
+    pulled_session = pull.call_args.args[1]
+    assert pulled_session.current_head == expected_head
+    assert pulled_session.workspace == str(tmp_path)
+    assert pulled_session.repo_relative == "ws"
+
+
+def test_start_new_session_preserves_explicit_snapshot(tmp_path):
+    ws = _stage_workspace(tmp_path)
+    base = subprocess.check_output(
+        ["git", "-C", ws, "rev-parse", "HEAD~"], text=True,
+    ).strip()
+    pinned_head = subprocess.check_output(
+        ["git", "-C", ws, "rev-parse", "HEAD"], text=True,
+    ).strip()
+    Path(ws, "foo.py").write_text("a\nb\nc\nd\n")
+    subprocess.run(
+        ["git", "-C", ws, "commit", "-q", "-am", "later head"],
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+    later_head = subprocess.check_output(
+        ["git", "-C", ws, "rev-parse", "HEAD"], text=True,
+    ).strip()
+    review_root = tmp_path / "reviews"
+    agents = [
+        {"name": "vera", "model": "opus", "persona": "vera.md"},
+        {"name": "Curator", "model": "gpt", "role": "curator"},
+    ]
+    config = tmp_path / ".peanut-review.json"
+    config.write_text(json.dumps({
+        "reviewRoot": str(review_root),
+        "workspaceRoot": str(tmp_path),
+        "repoRelative": "ws",
+        "agents": agents,
+    }))
+    pr_info = gh.PRInfo(
+        repo="acme/foo", number=42,
+        url="https://github.com/acme/foo/pull/42",
+        title="Add a feature", head_sha=later_head, base_sha=base,
+        head_ref_name="feature/add-it",
+    )
+    pull_result = MagicMock()
+    pull_result.summary.return_value = "Pulled 0 comments."
+
+    with (
+        patch("peanut_review.gh.resolve_pr_spec", return_value=("acme/foo", 42)),
+        patch("peanut_review.gh.fetch_pr_info", return_value=pr_info),
+        patch("peanut_review.gh_pull.pull_comments", return_value=pull_result),
+    ):
+        rc = main([
+            "start", "acme/foo#42", "--config", str(config),
+            "--base", base, "--topic", pinned_head, "--no-launch",
+        ])
+
+    assert rc == 0
+    created = sess.load_session(review_root / "foo-feature-add-it")
+    assert created.base_ref == base
+    assert created.current_head == pinned_head
+    assert created.github is not None
+    assert created.github.base_sha == base
+    assert created.github.head_sha == pinned_head
 
 
 def test_init_id_rejects_reserved_route_and_bad_chars(tmp_path):
@@ -506,6 +743,9 @@ def test_init_id_rejects_reserved_route_and_bad_chars(tmp_path):
 
 
 def test_start_from_project_config_with_bare_pr_number(gh_shim, tmp_path):
+    from peanut_review import launch
+
+    description = "## Motivation\n\nPreserve `bits` and ${SESSION}.\n\n- Tests: café ✓\n"
     ws = _stage_workspace(tmp_path)
     import subprocess
     head = subprocess.run(["git", "-C", ws, "rev-parse", "HEAD"],
@@ -523,16 +763,20 @@ def test_start_from_project_config_with_bare_pr_number(gh_shim, tmp_path):
         "agents": [
             {"name": "vera", "model": "opus", "persona": "vera.md"},
             {"name": "irene", "model": "gpt", "persona": "irene.md", "runner": "opencode"},
+            {
+                "name": "Curator", "model": "gpt-5.5-high",
+                "role": "curator",
+            },
         ],
     }))
 
-    gh_shim.set_fixtures([
+    fixtures = [
         {
             "match": ["pr", "view", "42", "url"],
             "stdout": json.dumps({"url": "https://github.com/acme/foo/pull/42"}),
         },
         {
-            "match": ["pr", "view", "42", "number,headRefOid,baseRefOid,headRefName,url,title"],
+            "match": ["pr", "view", "42", "number,headRefOid,baseRefOid,headRefName,url,title,body"],
             "stdout": json.dumps({
                 "number": 42,
                 "headRefOid": head,
@@ -540,6 +784,7 @@ def test_start_from_project_config_with_bare_pr_number(gh_shim, tmp_path):
                 "headRefName": "feature/add-it",
                 "url": "https://github.com/acme/foo/pull/42",
                 "title": "Add a feature",
+                "body": description,
             }),
         },
         {
@@ -563,20 +808,27 @@ def test_start_from_project_config_with_bare_pr_number(gh_shim, tmp_path):
                 "html_url": "https://h/i/200",
             }]),
         },
-    ])
+    ]
+    gh_shim.set_fixtures(fixtures)
 
     rc = main(["start", "42", "--config", str(config_path), "--no-launch"])
     assert rc == 0
 
     sd = review_root / "foo-feature-add-it"
     s = sess.load_session(sd)
-    assert s.workspace == ws
+    assert s.workspace == str(tmp_path)
+    assert s.repo_relative == "ws"
+    assert sess.repo_path(s) == ws
     assert s.timeout == 77
     assert s.github is not None
     assert s.github.repo == "acme/foo"
     assert s.github.number == 42
-    assert [a.name for a in s.agents] == ["vera", "irene"]
+    assert s.github.body == description
+    assert [a.name for a in sess.reviewer_agents(s)] == ["vera", "irene"]
     assert s.agents[1].runner == "opencode"
+    assert [(a.name, a.role, a.model, a.runner) for a in sess.curator_agents(s)] == [
+        ("Curator", "curator", "gpt-5.5-high", "cursor"),
+    ]
 
     comments = {c.external_id: c for c in store.read_all_comments(sd)}
     assert set(comments) == {"100", "200"}
@@ -585,6 +837,52 @@ def test_start_from_project_config_with_bare_pr_number(gh_shim, tmp_path):
     assert comments["100"].line == 2
     assert comments["200"].author == "gh:ghost"
     assert comments["200"].file == ""
+
+    for prompt in launch.render_all_prompts(sd).values():
+        text = prompt.read_text()
+        assert "Title: Add a feature" in text
+        assert "URL: https://github.com/acme/foo/pull/42" in text
+        assert description in text
+
+    # The review-pr.sh reuse path must refresh body-only edits, even when the
+    # pinned commit is unchanged, including when the author clears the body.
+    for updated_description in ["Updated motivation\n\n```sh\necho $PATH\n```\n", ""]:
+        pr_data = json.loads(fixtures[1]["stdout"])
+        pr_data["body"] = updated_description
+        fixtures[1]["stdout"] = json.dumps(pr_data)
+        gh_shim.set_fixtures(fixtures)
+        assert main([
+            "start", "42", "--config", str(config_path),
+            "--reuse", "--sync", "--no-launch",
+        ]) == 0
+        synced = sess.load_session(sd)
+        assert synced.github.body == updated_description
+        assert synced.current_head == head
+        assert all(not c.stale for c in store.read_all_comments(sd))
+        for prompt in launch.render_all_prompts(sd).values():
+            text = prompt.read_text()
+            assert description not in text
+            assert (updated_description or "(The PR has no description.)") in text
+
+
+def test_start_requires_curator_agent_in_project_config(tmp_path):
+    _stage_workspace(tmp_path)
+    config_path = tmp_path / ".peanut-review.json"
+    config_path.write_text(json.dumps({
+        "reviewRoot": str(tmp_path / "reviews"),
+        "workspaceRoot": str(tmp_path),
+        "repoRelative": "ws",
+        "agents": [
+            {"name": "vera", "model": "opus", "persona": "vera.md"},
+        ],
+    }))
+
+    err = io.StringIO()
+    with redirect_stderr(err):
+        rc = main(["start", "42", "--config", str(config_path), "--no-launch"])
+
+    assert rc == 1
+    assert "curator agent is not configured" in err.getvalue()
 
 
 # ---------------- gh-push ----------------
@@ -603,6 +901,50 @@ def _make_gh_session(tmp_path: Path) -> str:
         github=models.GitHubPR(
             repo="acme/foo", number=42, url="u",
             head_sha="abc", base_sha="def", title="t",
+        ),
+    )
+    sess.save_session(sd, s)
+    return str(sd)
+
+
+def _make_gh_git_session(tmp_path: Path) -> str:
+    """Build a GitHub-backed session whose diff has a narrow review hunk."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+    src = repo / "src"
+    src.mkdir()
+    lines = [f"value_{i:02d} = {i}\n" for i in range(1, 81)]
+    (src / "x.py").write_text("".join(lines))
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+    base = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    lines[39] = "value_40 = 'changed'\n"
+    (src / "x.py").write_text("".join(lines))
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-am", "topic"], check=True)
+    head = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+
+    sd = tmp_path / "sess"
+    (sd / "comments").mkdir(parents=True)
+    (sd / "signals").mkdir()
+    s = models.Session(
+        id="acme-foo-pr-42",
+        workspace=str(repo),
+        base_ref=base,
+        topic_ref=head,
+        original_head=head,
+        current_head=head,
+        github=models.GitHubPR(
+            repo="acme/foo", number=42, url="u",
+            head_sha=head, base_sha=base, title="t",
         ),
     )
     sess.save_session(sd, s)
@@ -654,11 +996,9 @@ def test_gh_push_anchored_and_global(gh_shim, tmp_path):
     sd = _make_gh_session(tmp_path)
     store.append_comment(sd, models.Comment(
         author="vera", file="src/x.py", line=10, body="anchored",
-        severity="warning",
     ))
     store.append_comment(sd, models.Comment(
         author="felix", file="", line=0, body="global",
-        severity="suggestion",
     ))
 
     gh_shim.set_fixtures([
@@ -679,12 +1019,13 @@ def test_gh_push_anchored_and_global(gh_shim, tmp_path):
     assert cs["anchored"].external_id == "100"
     assert cs["anchored"].external_url == "https://h/c/100"
     assert cs["anchored"].external_synced_body == "anchored"
-    assert cs["global"].deleted is True
-    assert cs["global"].deleted_by == "github-push"
+    assert cs["global"].deleted is False
+    assert cs["global"].deleted_by is None
     assert cs["global"].external_source == "github-review"
     assert cs["global"].external_id == "300"
     assert cs["global"].external_url == "https://h/r/300"
     assert cs["global"].external_synced_body == "global"
+    assert sess.load_session(sd).last_github_push_at is not None
 
     review_posts = [
         c for c in gh_shim.calls()
@@ -707,7 +1048,7 @@ def test_gh_push_anchored_and_global(gh_shim, tmp_path):
     )
 
 
-def test_gh_push_concats_global_comments_and_deletes_individuals(gh_shim, tmp_path):
+def test_gh_push_concats_global_comments_and_preserves_individuals(gh_shim, tmp_path):
     sd = _make_gh_session(tmp_path)
     store.append_comment(sd, models.Comment(
         author="vera", file="", line=0, body="first overall",
@@ -729,8 +1070,67 @@ def test_gh_push_concats_global_comments_and_deletes_individuals(gh_shim, tmp_pa
     }
 
     comments = store.read_all_comments(sd)
-    assert [c.deleted for c in comments] == [True, True]
+    assert [c.deleted for c in comments] == [False, False]
+    assert [c.external_source for c in comments] == [
+        "github-review", "github-review",
+    ]
+    assert [c.external_id for c in comments] == ["300", "300"]
+    assert [c.external_synced_body for c in comments] == [
+        payload["body"], payload["body"],
+    ]
+    assert len(store.filter_comments(comments)) == 2
     assert gh_push.plan_push(comments).total == 0
+
+    # Pulling the aggregate review back must not replace either local
+    # component with the combined body or import a third global comment.
+    gh_shim.set_fixtures([
+        {"match": ["api", "repos/acme/foo/pulls/42/comments"], "stdout": "[]"},
+        {"match": ["api", "repos/acme/foo/issues/42/comments"], "stdout": "[]"},
+        {
+            "match": ["api", "repos/acme/foo/pulls/42/reviews"],
+            "stdout": json.dumps([{
+                "id": 300,
+                "user": {"login": "jakub"},
+                "body": payload["body"],
+                "state": "COMMENTED",
+                "html_url": "https://h/r/300",
+                "submitted_at": "2026-08-22T18:00:00Z",
+            }]),
+        },
+    ])
+    assert main(["--session", sd, "gh-pull"]) == 0
+    comments = store.read_all_comments(sd)
+    assert [c.body for c in comments] == ["first overall", "second overall"]
+    assert [c.external_id for c in comments] == ["300", "300"]
+
+
+def test_gh_push_promotes_unreviewable_anchor_to_global(gh_shim, tmp_path):
+    sd = _make_gh_git_session(tmp_path)
+    store.append_comment(sd, models.Comment(
+        author="vera", file="src/x.py", line=1, body="far from the hunk",
+    ))
+
+    gh_shim.set_fixtures([_review_post_fixture(300)])
+
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = main(["--session", sd, "gh-push"])
+    assert rc == 0
+    assert "promoted 1 to global" in out.getvalue()
+
+    [call] = gh_shim.calls()
+    payload = json.loads(call["stdin"])
+    assert payload == {
+        "event": "COMMENT",
+        "body": "Original anchor: `src/x.py:1`\n\nfar from the hunk",
+    }
+
+    [stored] = store.read_all_comments(sd)
+    assert stored.deleted is False
+    assert stored.deleted_by is None
+    assert stored.external_source == "github-review"
+    assert stored.external_id == "300"
+    assert stored.external_synced_body == payload["body"]
 
 
 def test_gh_push_global_approval_posts_pr_review(gh_shim, tmp_path):
@@ -757,8 +1157,8 @@ def test_gh_push_global_approval_posts_pr_review(gh_shim, tmp_path):
     [stored] = store.read_all_comments(sd)
     assert stored.external_source == "github-review"
     assert stored.external_id == "300"
-    assert stored.deleted is True
-    assert stored.deleted_by == "github-push"
+    assert stored.deleted is False
+    assert stored.deleted_by is None
 
 
 def test_gh_push_global_request_changes_posts_blocking_review(gh_shim, tmp_path):
@@ -786,7 +1186,6 @@ def test_gh_push_skips_already_pushed_comments(gh_shim, tmp_path):
     sd = _make_gh_session(tmp_path)
     store.append_comment(sd, models.Comment(
         author="vera", file="src/x.py", line=10, body="local-only",
-        severity="warning",
     ))
     # Pre-pushed: should not POST again.
     pushed = models.Comment(
@@ -819,7 +1218,7 @@ def test_gh_push_multiline_sends_end_as_line_and_start_as_start_line(gh_shim, tm
     sd = _make_gh_session(tmp_path)
     store.append_comment(sd, models.Comment(
         author="vera", file="src/x.py", line=10, end_line=14,
-        body="range comment", severity="warning",
+        body="range comment",
     ))
 
     gh_shim.set_fixtures([
@@ -861,11 +1260,119 @@ def test_gh_push_single_line_omits_start_line(gh_shim, tmp_path):
     assert "start_line" not in payload
 
 
-def test_gh_push_inline_only_uses_default_review_body(gh_shim, tmp_path):
+def test_default_review_body_has_multiple_templates_for_each_shape():
+    template_pools = (
+        gh_push._SINGLE_INLINE_NEUTRAL_TEMPLATES,
+        gh_push._INLINE_NEUTRAL_TEMPLATES,
+        gh_push._MIXED_NEUTRAL_TEMPLATES,
+    )
+    assert all(len(pool) > 1 for pool in template_pools)
+
+    def bodies(inline_count: int, reply_count: int) -> set[str]:
+        variants = set()
+        for variant in range(64):
+            inline = [
+                models.Comment(id=f"c_{variant}_top_{i}")
+                for i in range(inline_count)
+            ]
+            replies = [
+                models.Comment(id=f"c_{variant}_reply_{i}")
+                for i in range(reply_count)
+            ]
+            variants.add(gh_push._default_review_body(inline, replies))
+        return variants
+
+    for shape in ((1, 0), (3, 0), (1, 1), (1, 3), (3, 1), (3, 3)):
+        assert len(bodies(*shape)) > 1
+
+
+def test_default_review_body_uses_neutral_non_decision_tone():
+    bodies = set()
+    for variant in range(64):
+        for inline_count, reply_count in ((1, 0), (3, 0), (1, 3), (3, 3)):
+            bodies.add(gh_push._default_review_body(
+                [models.Comment(id=f"c_{variant}_top_{index}")
+                 for index in range(inline_count)],
+                [models.Comment(id=f"c_{variant}_reply_{index}")
+                 for index in range(reply_count)],
+            ))
+    assert all(
+        marker not in body.lower()
+        for body in bodies
+        for marker in (
+            "block", "must", "required", "request changes", "critical",
+            "warning", "issue", "nit", "suggestion", "small", "minor",
+        )
+    )
+
+
+
+@pytest.mark.parametrize(("inline_count", "reply_count", "fragments"), [
+    (1, 0, ("one",)),
+    (3, 0, ("comment",)),
+    (6, 0, ("comment",)),
+    (1, 1, ("comment", "reply")),
+    (1, 3, ("comment", "repl")),
+    (6, 7, ("comment", "repl")),
+])
+def test_default_review_body_describes_human_scaled_quantities(
+    inline_count, reply_count, fragments,
+):
+    inline = [
+        models.Comment(
+            id=f"c_top_{i}",
+        )
+        for i in range(inline_count)
+    ]
+    replies = [
+        models.Comment(
+            id=f"c_reply_{i}",
+        )
+        for i in range(reply_count)
+    ]
+
+    body = gh_push._default_review_body(inline, replies).lower()
+
+    assert all(fragment in body for fragment in fragments)
+
+
+@pytest.mark.parametrize("count", [3, 5, 7])
+def test_default_review_body_varies_exact_and_fuzzy_small_counts(count):
+    bodies = {
+        gh_push._default_review_body([
+            models.Comment(
+                id=f"c_{variant}_top_{index}",
+            )
+            for index in range(count)
+        ], []).lower()
+        for variant in range(128)
+    }
+
+    assert any(str(count) in body for body in bodies)
+    assert any(str(count) not in body for body in bodies)
+
+
+@pytest.mark.parametrize("count", [8, 18])
+def test_default_review_body_never_materializes_large_counts(count):
+    bodies = {
+        gh_push._default_review_body([
+            models.Comment(
+                id=f"c_{variant}_top_{index}",
+            )
+            for index in range(count)
+        ], []).lower()
+        for variant in range(128)
+    }
+
+    assert all(str(count) not in body for body in bodies)
+
+
+def test_gh_push_inline_only_uses_count_aware_review_body(gh_shim, tmp_path):
     sd = _make_gh_session(tmp_path)
-    store.append_comment(sd, models.Comment(
+    inline = models.Comment(
         author="vera", file="src/x.py", line=7, body="single",
-    ))
+    )
+    store.append_comment(sd, inline)
 
     gh_shim.set_fixtures([
         _review_post_fixture(300),
@@ -877,7 +1384,9 @@ def test_gh_push_inline_only_uses_default_review_body(gh_shim, tmp_path):
     rc = main(["--session", sd, "gh-push"])
     assert rc == 0
     [call] = [c for c in gh_shim.calls() if "-X" in c["argv"]]
-    assert json.loads(call["stdin"])["body"] == "A few comments"
+    assert json.loads(call["stdin"])["body"] == gh_push._default_review_body(
+        [inline], [],
+    )
 
 
 def test_gh_error_surfaces_response_body(gh_shim):
@@ -957,10 +1466,45 @@ def test_gh_push_pushes_reply_after_parent(gh_shim, tmp_path):
         rc = main(["--session", sd, "gh-push"])
     assert rc == 0
     assert "Pushed 2" in out.getvalue()
+    review_call = next(
+        c for c in gh_shim.calls()
+        if "repos/acme/foo/pulls/42/reviews" in c["argv"]
+        and "-X" in c["argv"]
+    )
+    assert json.loads(review_call["stdin"])["body"] == (
+        gh_push._default_review_body(
+            [parent],
+            [next(c for c in store.read_all_comments(sd) if c.body == "reply")],
+        )
+    )
     by_body = {c.body: c for c in store.read_all_comments(sd)}
     assert by_body["parent"].external_id == "200"
     assert by_body["reply"].external_id == "201"
     assert by_body["reply"].external_in_reply_to == "200"
+
+
+def test_gh_push_rejects_legacy_global_reply_without_api_call(gh_shim, tmp_path):
+    sd = _make_gh_session(tmp_path)
+    parent = models.Comment(
+        author="gh:octocat", file="", line=0, body="global",
+        external_source="github", external_id="100",
+        external_synced_body="global",
+    )
+    reply = models.Comment(
+        author="felix", file="", line=0, body="reply",
+        reply_to=parent.id,
+    )
+    plan = gh_push.plan_push([parent, reply])
+    session = sess.load_session(sd)
+    assert session.github is not None
+
+    result = gh_push.execute_push(sd, session, session.github, plan)
+
+    assert result.failed == 1
+    assert result.items[0].error == (
+        "GitHub does not support replies to global comments"
+    )
+    assert gh_shim.calls() == []
 
 
 def test_gh_push_skips_orphan_replies(gh_shim, tmp_path):
@@ -1062,7 +1606,6 @@ def test_gh_push_skips_meta_comments(gh_shim, tmp_path):
     sd = _make_gh_session(tmp_path)
     store.append_comment(sd, models.Comment(
         author="vera", file="__meta__", line=0, body="## Test execution: ok",
-        severity="nit",
     ))
     store.append_comment(sd, models.Comment(
         author="vera", file="src/x.py", line=10, body="real finding",
@@ -1099,6 +1642,7 @@ def test_gh_push_dry_run_does_not_call_gh(gh_shim, tmp_path):
     assert gh_shim.calls() == []
     # Comment is still local-only.
     assert store.read_all_comments(sd)[0].external_id is None
+    assert sess.load_session(sd).last_github_push_at is None
 
 
 def test_gh_push_refuses_session_without_github_field(tmp_path):
@@ -1163,10 +1707,6 @@ def test_gh_pull_appends_anchored_and_global_comments(gh_shim, tmp_path):
     assert by_author["gh:octocat"].external_id == "100"
     assert by_author["gh:ghost"].file == ""
     assert by_author["gh:ghost"].external_id == "200"
-    # Imported comments without an explicit severity marker default to
-    # `feedback` — they're discussion, not actionable findings.
-    assert by_author["gh:octocat"].severity == models.Severity.FEEDBACK.value
-    assert by_author["gh:ghost"].severity == models.Severity.FEEDBACK.value
 
 
 def test_gh_pull_imports_resolved_review_thread(gh_shim, tmp_path):
@@ -1405,7 +1945,6 @@ def test_gh_pull_appends_pr_review_summaries(gh_shim, tmp_path):
     [comment] = store.read_all_comments(sd)
     assert comment.author == "gh:qedawkins"
     assert comment.file == ""
-    assert comment.severity == models.Severity.WARNING.value
     assert comment.category == models.CommentCategory.REQUEST_CHANGES.value
     assert comment.external_source == "github-review"
     assert comment.external_id == "4100433093"
@@ -1511,10 +2050,8 @@ def test_gh_pull_repairs_existing_review_categories(gh_shim, tmp_path):
     assert comment.versions == []
 
 
-def test_gh_pull_classifies_nit_prefix_as_nit(gh_shim, tmp_path):
-    """Bodies that start with a `nit:`/`nit -`/`(nit)` style prefix in the
-    first two lines are imported as severity=nit instead of feedback —
-    matches the convention humans use on GitHub."""
+def test_gh_pull_preserves_impact_prose_without_classifying(gh_shim, tmp_path):
+    """Import the author's exact wording without deriving metadata from it."""
     sd = _make_gh_session(tmp_path)
 
     review = [
@@ -1526,8 +2063,6 @@ def test_gh_pull_classifies_nit_prefix_as_nit(gh_shim, tmp_path):
          "body": "(nit) prefer `let` over `var`", "commit_id": "abc"},
         {"id": 4, "user": {"login": "d"}, "path": "x.py", "line": 4,
          "body": "Looks good!\nnit: also drop the blank line", "commit_id": "abc"},
-        # Negative cases: word "nit" embedded mid-sentence or past line 2
-        # must NOT trigger reclassification.
         {"id": 5, "user": {"login": "e"}, "path": "x.py", "line": 5,
          "body": "this is an infinite loop", "commit_id": "abc"},
         {"id": 6, "user": {"login": "f"}, "path": "x.py", "line": 6,
@@ -1544,12 +2079,12 @@ def test_gh_pull_classifies_nit_prefix_as_nit(gh_shim, tmp_path):
     assert rc == 0
 
     cs = {c.external_id: c for c in store.read_all_comments(sd)}
-    assert cs["1"].severity == models.Severity.NIT.value
-    assert cs["2"].severity == models.Severity.NIT.value
-    assert cs["3"].severity == models.Severity.NIT.value
-    assert cs["4"].severity == models.Severity.NIT.value
-    assert cs["5"].severity == models.Severity.FEEDBACK.value
-    assert cs["6"].severity == models.Severity.FEEDBACK.value
+    for raw in review:
+        comment = cs[str(raw["id"])]
+        assert comment.body == raw["body"]
+        assert comment.external_synced_body == raw["body"]
+        assert comment.category == "comment"
+        assert "severity" not in json.loads(comment.to_json())
 
 
 def test_gh_pull_dedupes_by_external_id(gh_shim, tmp_path):

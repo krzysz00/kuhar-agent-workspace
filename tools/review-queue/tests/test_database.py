@@ -1,0 +1,624 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import timedelta
+from pathlib import Path
+
+import pytest
+
+from review_queue.database import Database
+from review_queue.models import ProjectConfig, PullRequest
+from review_queue.util import isoformat, utc_now
+
+
+def pr(
+    project: ProjectConfig,
+    number: int,
+    *,
+    head: str,
+    hours_ago: int = 1,
+    author: str = "alice",
+) -> PullRequest:
+    return PullRequest(
+        project=project.name,
+        repo=project.repo,
+        number=number,
+        url=f"https://github.com/{project.repo}/pull/{number}",
+        title=f"PR {number}",
+        author=author,
+        head_sha=head,
+        head_ref=f"users/{author}/pr-{number}",
+        updated_at=isoformat(utc_now() - timedelta(hours=hours_ago)),
+    )
+
+
+def database(tmp_path: Path, project: ProjectConfig) -> Database:
+    db = Database(tmp_path / "queue.sqlite3")
+    db.seed((project,), start_paused=False)
+    return db
+
+
+def test_approval_state_persists_and_refreshes_in_queue_and_retained_views(tmp_path, project):
+    db = database(tmp_path, project)
+    record = replace(
+        pr(project, 1, head="a" * 40), approval_viewer="me", approved_by=("alice", "me")
+    )
+    db.apply_poll(project, [record], query_numbers={1}, bootstrap_hours=24, push_quiet_seconds=0)
+    db.create_wrapper(
+        project=project.name,
+        repo=project.repo,
+        number=1,
+        path=tmp_path / "wrapper",
+        token="owned",
+        head_ref="topic",
+    )
+    db.close()
+    db = database(tmp_path, project)
+    for view in (*db.queue_items(), *db.wrappers()):
+        assert view.approval_viewer == "me"
+        assert view.approved_by == ("alice", "me")
+    record = replace(record, approved_by=("alice",))
+    db.apply_poll(project, [record], query_numbers={1}, bootstrap_hours=24, push_quiet_seconds=0)
+    assert len(db.queue_items()) == 1  # Approval changes do not enqueue another review.
+    assert db.queue_items()[0].approved_by == ("alice",)
+    assert db.wrappers()[0].approved_by == ("alice",)
+    db.set_manual_watch(replace(record, approved_by=()), enqueue=False)
+    assert db.wrappers()[0].approved_by == ()
+    db.connection.execute("UPDATE pull_requests SET eligible=0, manual_watch=0")
+    assert db.poll_followups(project.name) == (1,)  # Retained rows still get approval updates.
+    db.close()
+
+
+@pytest.mark.parametrize(
+    "change", ["same", "new-head", "closed", "draft", "ignored", "ineligible", "filter", "queued"]
+)
+def test_restart_only_retries_current_eligible_revision_once(tmp_path, project, change):
+    db = database(tmp_path, project)
+    record = pr(project, 1, head="a" * 40)
+    db.apply_poll(project, [record], query_numbers={1}, bootstrap_hours=24, push_quiet_seconds=0)
+    db.update_job(1, status="running")
+    db.mark_cancelling(1, resume_on_restart=True)
+    db.update_job(1, status="cancelled")
+    assert db.job_row(1)["status"] == "interrupted"
+    if change == "new-head":
+        db.apply_poll(
+            project,
+            [replace(record, head_sha="b" * 40)],
+            query_numbers={1},
+            bootstrap_hours=24,
+            push_quiet_seconds=0,
+        )
+    elif change == "closed":
+        db.connection.execute("UPDATE pull_requests SET state = 'CLOSED'")
+    elif change == "draft":
+        db.connection.execute("UPDATE pull_requests SET is_draft = 1")
+    elif change == "ignored":
+        db.ignore_pr(record.repo, record.number)
+    elif change == "ineligible":
+        db.connection.execute("UPDATE pull_requests SET eligible = 0")
+    elif change == "filter":
+        db.seed((replace(project, include_paths=("new-path/",)),), start_paused=False)
+    elif change == "queued":
+        db.enqueue_current(record.repo, record.number)
+    db.connection.commit()
+    db.set_mode("manual")
+    resumed = db.resume_interrupted_jobs(project.name)
+    assert resumed == (1 if change == "same" else 0)
+    assert db.resume_interrupted_jobs(project.name) == 0
+    assert not db.job_row(1)["resume_on_restart"]
+    if change in {"same", "queued"}:
+        assert len(db.queue_items()) == 1
+        assert db.next_ready().head_sha == record.head_sha
+    else:
+        assert db.next_ready() is None
+    db.close()
+
+
+def test_manual_mode_holds_automatic_work_and_requires_each_new_head(tmp_path, project):
+    db = database(tmp_path, project)
+    first = pr(project, 1, head="a" * 40)
+    second = pr(project, 2, head="b" * 40)
+
+    def poll(*records):
+        db.apply_poll(
+            project,
+            records,
+            query_numbers={r.number for r in records},
+            bootstrap_hours=24,
+            push_quiet_seconds=0,
+        )
+
+    poll(first, second)
+    db.set_mode("manual")
+    assert len(db.queue_items()) == 2
+    assert db.next_ready() is None
+    job = db.enqueue_current(first.repo, first.number)
+    assert db.next_ready().job_id == job
+    assert db.next_ready().manual_enqueued
+    assert db.enqueue_current(first.repo, first.number) == job
+    assert len(db.queue_items()) == 2
+
+    pushed = replace(first, head_sha="c" * 40)
+    poll(pushed, second)
+    assert db.next_ready() is None
+    assert not any(item.manual_enqueued for item in db.queue_items())
+    db.set_manual_watch(pushed)  # Explicit `n` also approves an already discovered head.
+    assert db.next_ready().number == first.number
+    db.update_job(db.next_ready().job_id, status="succeeded")
+    poll(replace(pushed, head_sha="d" * 40), second)
+    assert db.next_ready() is None  # Watching future heads is not approval to run them.
+    db.set_mode("active")
+    assert db.next_ready() is not None
+
+
+def test_manual_mode_eligibility_restoration_is_not_user_enqueue(tmp_path, project):
+    db = database(tmp_path, project)
+    item = pr(project, 1, head="a" * 40)
+    db.set_mode("manual")
+    for record in (item, replace(item, is_draft=True), item):
+        db.apply_poll(
+            project, (record,), query_numbers={1}, bootstrap_hours=24, push_quiet_seconds=0
+        )
+    assert len(db.queue_items()) == 1
+    assert db.next_ready() is None
+    db.ignore_pr(item.repo, item.number)
+    assert not db.queue_items()
+
+
+@pytest.mark.parametrize("initial", ["active", "manual", "paused"])
+def test_dispatch_mode_persistence_and_legacy_migration(tmp_path, project, initial):
+    path = tmp_path / "queue.sqlite3"
+    db = Database(path)
+    db.seed((project,), start_paused=False, start_mode=initial)
+    assert db.mode() == initial
+    db.set_mode("manual")
+    db.set_paused(True)
+    db.close()
+    db = Database(path)
+    db.seed((project,), start_paused=False, start_mode="active")
+    assert db.mode() == "paused"
+    db.set_paused(False)
+    assert db.mode() == "manual"
+    db.set_mode("active")
+    with db.connection:
+        db.connection.execute("DELETE FROM settings WHERE key='manual_only'")
+    db.seed((project,), start_paused=True, start_mode="manual")
+    assert db.mode() == "active"  # Existing legacy selection wins over startup config.
+
+
+def test_bootstrap_only_queues_recent_then_watches_head_changes(
+    tmp_path: Path, project: ProjectConfig
+) -> None:
+    db = database(tmp_path, project)
+    recent = pr(project, 1, head="a" * 40)
+    old = pr(project, 2, head="b" * 40, hours_ago=48)
+    outcome = db.apply_poll(
+        project,
+        (recent, old),
+        query_numbers={1, 2},
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+    assert outcome.queued == 1
+    assert [item.number for item in db.queue_items()] == [1]
+
+    changed = pr(project, 2, head="c" * 40, hours_ago=0)
+    outcome = db.apply_poll(
+        project,
+        (recent, changed),
+        query_numbers={1, 2},
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+    assert outcome.changed_heads == 1
+    assert {item.number for item in db.queue_items()} == {1, 2}
+
+
+def test_pushes_coalesce_and_running_head_is_not_preempted(
+    tmp_path: Path, project: ProjectConfig
+) -> None:
+    db = database(tmp_path, project)
+    first = pr(project, 9, head="1" * 40)
+    db.apply_poll(
+        project,
+        (first,),
+        query_numbers={9},
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+    first_job = db.queue_items()[0]
+    db.update_job(first_job.job_id, status="running")
+
+    second = pr(project, 9, head="2" * 40, hours_ago=0)
+    third = pr(project, 9, head="3" * 40, hours_ago=0)
+    for record in (second, third):
+        db.apply_poll(
+            project,
+            (record,),
+            query_numbers={9},
+            bootstrap_hours=24,
+            push_quiet_seconds=0,
+        )
+    waiting = db.queue_items()
+    assert len(waiting) == 1
+    assert waiting[0].head_sha == "3" * 40
+    assert db.job_row(first_job.job_id)["status"] == "running"
+
+
+def test_priority_changes_rebalance_waiting_queue_without_running_preemption(
+    tmp_path: Path, project: ProjectConfig
+) -> None:
+    db = database(tmp_path, project)
+    one = pr(project, 1, head="a" * 40, author="alice")
+    two = pr(project, 2, head="b" * 40, author="bob")
+    db.apply_poll(
+        project,
+        (one, two),
+        query_numbers={1, 2},
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+    assert [item.number for item in db.queue_items()] == [1, 2]
+    selected = next(item for item in db.queue_items() if item.number == 2)
+    db.set_priorities(
+        project=selected.project,
+        author=selected.author,
+        repo=selected.repo,
+        number=selected.number,
+        project_priority=3,
+        author_priority=20,
+        pr_priority=7,
+    )
+    ordered = db.queue_items()
+    assert ordered[0].number == 2
+    assert ordered[0].score == 30
+
+
+def test_leaving_query_cancels_waiting_but_manual_retry_is_allowed(
+    tmp_path: Path, project: ProjectConfig
+) -> None:
+    db = database(tmp_path, project)
+    record = pr(project, 4, head="d" * 40)
+    db.apply_poll(
+        project,
+        (record,),
+        query_numbers={4},
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+    db.apply_poll(
+        project,
+        (),
+        query_numbers=set(),
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+    assert db.queue_items() == ()
+    retry = db.enqueue_current(project.repo, 4)
+    assert db.job_row(retry)["attempt"] == 2
+
+
+@pytest.mark.parametrize("manual_include", [False, True])
+@pytest.mark.parametrize("state,draft", [("CLOSED", False), ("MERGED", False), ("OPEN", True)])
+def test_pr_state_changes_only_disqualify_automatic_work(
+    tmp_path, project, manual_include, state, draft
+):
+    db = database(tmp_path, project)
+    opened = pr(project, 18, head="e" * 40)
+    if manual_include:
+        db.set_manual_watch(opened)
+    else:
+        db.apply_poll(
+            project, [opened], query_numbers={18}, bootstrap_hours=24, push_quiet_seconds=0
+        )
+    job_id = db.queue_items()[0].job_id
+    db.close()
+    db = database(tmp_path, project)
+    changed = replace(opened, state=state, is_draft=draft)
+    outcome = db.apply_poll(
+        project, [changed], query_numbers=set(), bootstrap_hours=24, push_quiet_seconds=0
+    )
+    assert outcome.left_query == (0 if manual_include else 1)
+    assert db.manual_watches(project.name) == ((18,) if manual_include else ())
+    assert db.job_row(job_id)["status"] == ("queued" if manual_include else "ineligible")
+    if manual_include:
+        assert db.next_ready().job_id == job_id
+        assert db.enqueue_current(project.repo, 18) == job_id
+        db.update_job(job_id, status="failed")
+        retry = db.enqueue_current(project.repo, 18)
+        assert db.job_row(retry)["attempt"] == 2
+        db.ignore_pr(project.repo, 18)
+        db.apply_poll(
+            project, [changed], query_numbers={18}, bootstrap_hours=24, push_quiet_seconds=0
+        )
+        assert not db.queue_items()
+        assert not db.manual_watches(project.name)
+        db.set_manual_watch(changed)
+        assert db.next_ready().head_sha == changed.head_sha
+    else:
+        assert not db.queue_items()
+        with pytest.raises(ValueError, match="not open"):
+            db.enqueue_current(project.repo, 18)
+    db.close()
+
+
+@pytest.mark.parametrize("state,draft", [("CLOSED", False), ("MERGED", False), ("OPEN", True)])
+def test_manually_included_pr_can_resume_after_restart(tmp_path, project, state, draft):
+    project = replace(project, include_paths=("emulation/",))
+    db = database(tmp_path, project)
+    record = replace(pr(project, 1, head="a" * 40), state=state, is_draft=draft)
+    db.set_manual_watch(record)
+    db.set_mode("manual")
+    db.update_job(1, status="running")
+    db.mark_cancelling(1, resume_on_restart=True)
+    db.update_job(1, status="cancelled")
+    db.close()
+    db = database(tmp_path, project)
+    db.apply_poll(
+        project, [record], query_numbers=set(), bootstrap_hours=24, push_quiet_seconds=0
+    )
+    assert db.resume_interrupted_jobs(project.name) == 1
+    assert db.next_ready().head_sha == record.head_sha
+    assert db.next_ready().manual_enqueued
+    assert db.resume_interrupted_jobs(project.name) == 0
+    db.close()
+
+
+def test_new_head_reports_completed_review_count(tmp_path: Path, project: ProjectConfig) -> None:
+    db = database(tmp_path, project)
+    first = pr(project, 12, head="a" * 40)
+    db.apply_poll(
+        project,
+        (first,),
+        query_numbers={12},
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+    db.update_job(db.queue_items()[0].job_id, status="succeeded")
+
+    returned = pr(project, 12, head="b" * 40, hours_ago=0)
+    db.apply_poll(
+        project,
+        (returned,),
+        query_numbers={12},
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+    assert db.queue_items()[0].review_count == 1
+
+
+def test_permanent_ignore_suppresses_pushes_until_manual_inclusion(
+    tmp_path: Path, project: ProjectConfig
+) -> None:
+    db = database(tmp_path, project)
+    first = pr(project, 13, head="a" * 40)
+    db.apply_poll(
+        project,
+        (first,),
+        query_numbers={13},
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+    db.ignore_pr(project.repo, 13)
+    assert db.queue_items() == ()
+
+    pushed = pr(project, 13, head="b" * 40, hours_ago=0)
+    db.apply_poll(
+        project,
+        (pushed,),
+        query_numbers={13},
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+    assert db.queue_items() == ()
+
+    db.set_manual_watch(pushed)
+    assert db.queue_items()[0].head_sha == "b" * 40
+
+
+def test_same_head_is_requeued_when_it_returns_to_query(
+    tmp_path: Path, project: ProjectConfig
+) -> None:
+    db = database(tmp_path, project)
+    record = pr(project, 14, head="a" * 40)
+    db.apply_poll(
+        project,
+        (record,),
+        query_numbers={14},
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+    first_job = db.queue_items()[0].job_id
+    db.update_job(first_job, status="succeeded")
+    db.apply_poll(
+        project,
+        (),
+        query_numbers=set(),
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+
+    outcome = db.apply_poll(
+        project,
+        (record,),
+        query_numbers={14},
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+    assert outcome.queued == 1
+    assert db.queue_items()[0].job_id != first_job
+
+
+def test_manual_inclusion_requeues_ignored_same_head_once(
+    tmp_path: Path, project: ProjectConfig
+) -> None:
+    db = database(tmp_path, project)
+    record = pr(project, 15, head="b" * 40)
+    db.apply_poll(
+        project,
+        (record,),
+        query_numbers={15},
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+    db.ignore_pr(project.repo, 15)
+    db.set_manual_watch(record)
+    queued = db.queue_items()
+    assert len(queued) == 1
+    assert db.job_row(queued[0].job_id)["attempt"] == 2
+
+    db.set_manual_watch(record)
+    assert len(db.queue_items()) == 1
+
+
+def test_manual_inclusion_supersedes_waiting_older_head(
+    tmp_path: Path, project: ProjectConfig
+) -> None:
+    db = database(tmp_path, project)
+    first = pr(project, 17, head="e" * 40)
+    db.apply_poll(
+        project,
+        (first,),
+        query_numbers={17},
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+    first_job = db.queue_items()[0].job_id
+    pushed = pr(project, 17, head="f" * 40, hours_ago=0)
+
+    db.set_manual_watch(pushed)
+
+    queued = db.queue_items()
+    assert [item.head_sha for item in queued] == ["f" * 40]
+    assert db.job_row(first_job)["status"] == "superseded"
+
+
+def test_new_head_waits_while_same_pr_is_under_review(
+    tmp_path: Path, project: ProjectConfig
+) -> None:
+    db = database(tmp_path, project)
+    first = pr(project, 16, head="c" * 40)
+    db.apply_poll(
+        project,
+        (first,),
+        query_numbers={16},
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+    first_job = db.queue_items()[0].job_id
+    db.update_job(first_job, status="running")
+    pushed = pr(project, 16, head="d" * 40, hours_ago=0)
+    db.apply_poll(
+        project,
+        (pushed,),
+        query_numbers={16},
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+
+    assert db.next_ready() is None
+    db.update_job(first_job, status="succeeded")
+    assert db.next_ready().head_sha == "d" * 40
+
+
+def test_seed_rejects_project_repository_identity_change(
+    tmp_path: Path, project: ProjectConfig
+) -> None:
+    db = database(tmp_path, project)
+    changed = replace(project, repo="ROCm/different")
+    with pytest.raises(ValueError, match="repository changed"):
+        db.seed((changed,), start_paused=False)
+
+
+def test_path_filter_blocks_automatic_and_retry_until_matching_push(tmp_path, project):
+    project = replace(project, include_paths=("emulation/",))
+    db = database(tmp_path, project)
+    outside = replace(pr(project, 42, head="a" * 40), path_filter_key=project.path_filter_key)
+    db.apply_poll(project, [outside], query_numbers={42}, bootstrap_hours=24, push_quiet_seconds=0)
+    assert not db.queue_items()
+    with pytest.raises(ValueError, match="include_paths"):
+        db.enqueue_current(project.repo, 42)
+    included = replace(outside, head_sha="b" * 40, path_filter_passed=True)
+    db.apply_poll(project, [included], query_numbers={42}, bootstrap_hours=24, push_quiet_seconds=0)
+    assert db.next_ready().head_sha == included.head_sha
+    outside_again = replace(outside, head_sha="c" * 40)
+    db.apply_poll(
+        project, [outside_again], query_numbers={42}, bootstrap_hours=24, push_quiet_seconds=0
+    )
+    assert not db.queue_items()
+    assert db.manual_watches(project.name) == ()
+    assert db.connection.execute("SELECT ignored FROM pull_requests").fetchone()[0] == 0
+    assert all(row[0] != "queued" for row in db.connection.execute("SELECT status FROM jobs"))
+    with pytest.raises(ValueError, match="include_paths"):
+        db.enqueue_current(project.repo, 42)
+    included_again = replace(included, head_sha="d" * 40)
+    db.apply_poll(
+        project, [included_again], query_numbers={42}, bootstrap_hours=24, push_quiet_seconds=0
+    )
+    assert db.next_ready().head_sha == included_again.head_sha
+
+
+def test_enabling_or_changing_path_filter_holds_old_queue_until_rechecked(tmp_path, project):
+    db = database(tmp_path, project)
+    record = pr(project, 42, head="a" * 40)
+    db.apply_poll(project, [record], query_numbers={42}, bootstrap_hours=24, push_quiet_seconds=0)
+    assert db.next_ready()
+    db.close()
+    required = replace(project, include_paths=("emulation/",))
+    db = database(tmp_path, required)
+    assert db.next_ready() is None
+    with pytest.raises(ValueError, match="include_paths"):
+        db.enqueue_current(project.repo, 42)
+    checked = replace(record, path_filter_key=required.path_filter_key, path_filter_passed=True)
+    db.apply_poll(required, [checked], query_numbers={42}, bootstrap_hours=24, push_quiet_seconds=0)
+    assert db.next_ready()
+    db.close()
+    db = database(tmp_path, replace(project, include_paths=("other/",)))
+    assert db.next_ready() is None
+    with pytest.raises(ValueError, match="include_paths"):
+        db.enqueue_current(project.repo, 42)
+
+
+def test_explicit_inclusion_bypasses_paths_across_poll_restart_push_and_retry(tmp_path, project):
+    project = replace(project, include_paths=("emulation/",))
+    db = database(tmp_path, project)
+    outside = replace(pr(project, 42, head="a" * 40), path_filter_key=project.path_filter_key)
+    db.set_manual_watch(outside)
+    first = db.next_ready()
+    assert first is not None
+    db.apply_poll(project, [outside], query_numbers=set(), bootstrap_hours=24, push_quiet_seconds=0)
+    assert db.next_ready().job_id == first.job_id
+    db.update_job(first.job_id, status="running")
+    db.mark_cancelling(first.job_id, resume_on_restart=True)
+    db.update_job(first.job_id, status="cancelled")
+    db.close()
+
+    changed_filter = replace(project, include_paths=("website/",))
+    db = database(tmp_path, changed_filter)
+    db.apply_poll(
+        changed_filter, [outside], query_numbers=set(), bootstrap_hours=24, push_quiet_seconds=0
+    )
+    assert db.resume_interrupted_jobs(project.name) == 1
+    assert db.resume_interrupted_jobs(project.name) == 0
+    resumed = db.next_ready()
+    assert resumed.head_sha == outside.head_sha
+    db.update_job(resumed.job_id, status="failed")
+    assert db.enqueue_current(project.repo, 42) != resumed.job_id
+    db.set_mode("manual")
+    pushed = replace(outside, head_sha="b" * 40)
+    db.apply_poll(
+        changed_filter, [pushed], query_numbers=set(), bootstrap_hours=24, push_quiet_seconds=0
+    )
+    assert db.manual_watches(project.name) == (42,)
+    assert db.queue_items()[0].head_sha == pushed.head_sha
+    assert db.next_ready() is None  # A new head still needs manual enqueue in manual mode.
+    db.enqueue_current(project.repo, 42)
+    assert db.next_ready().head_sha == pushed.head_sha
+    db.ignore_pr(project.repo, 42)
+    assert db.manual_watches(project.name) == ()
+    db.apply_poll(
+        changed_filter, [pushed], query_numbers={42}, bootstrap_hours=24, push_quiet_seconds=0
+    )
+    assert not db.queue_items()
+    with pytest.raises(ValueError, match="include_paths"):
+        db.enqueue_current(project.repo, 42)

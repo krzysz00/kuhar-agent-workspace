@@ -6,6 +6,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 
 
 def _now_iso() -> str:
@@ -18,18 +19,6 @@ def _now_iso() -> str:
 
 def _short_id(prefix: str = "c") -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
-
-
-class Severity(str, Enum):
-    CRITICAL = "critical"
-    WARNING = "warning"
-    SUGGESTION = "suggestion"
-    NIT = "nit"
-    # Non-actionable observations: questions, praise, FYI notes, and
-    # imported comments from external systems (e.g. GitHub) that carry no
-    # severity of their own. NOT a fallback for "I'm not sure how serious"
-    # — pick a real severity if you're asking for a change.
-    FEEDBACK = "feedback"
 
 
 class CommentCategory(str, Enum):
@@ -69,19 +58,70 @@ def category_is_review_decision(category: str | None) -> bool:
     }
 
 
-class SessionState(str, Enum):
-    INIT = "init"
-    ROUND = "round"
-    COMPLETE = "complete"
-    ABORTED = "aborted"
-
-
 class AgentStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
     TIMEOUT = "timeout"
+
+
+class AgentRole(str, Enum):
+    REVIEWER = "reviewer"
+    CURATOR = "curator"
+
+
+@dataclass
+class SshTarget:
+    """One pre-established SSH reviewer target.
+
+    The target describes paths that already exist on the remote host. Peanut
+    review verifies them before launch and never checks out, cleans, or builds
+    the remote repository.
+    """
+
+    host: str = ""
+    control_path: str = ""
+    gateway_url: str = ""
+    workspace_root: str = ""
+    repo_relative: str = ""
+    build_roots: list[str] = field(default_factory=list)
+    peanut_review_bin: str = "peanut-review"
+    runtime_root: str = "/tmp/peanut-review-ssh"
+
+    def repo_path(self) -> str:
+        if not self.repo_relative or self.repo_relative == ".":
+            return self.workspace_root
+        return str(Path(self.workspace_root) / self.repo_relative)
+
+    def to_dict(self) -> dict:
+        return {
+            "host": self.host,
+            "controlPath": self.control_path,
+            "gatewayUrl": self.gateway_url,
+            "workspaceRoot": self.workspace_root,
+            "repoRelative": self.repo_relative or ".",
+            "buildRoots": list(self.build_roots),
+            "peanutReviewBin": self.peanut_review_bin,
+            "runtimeRoot": self.runtime_root,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SshTarget:
+        raw = dict(data)
+        aliases = {
+            "controlPath": "control_path",
+            "gatewayUrl": "gateway_url",
+            "workspaceRoot": "workspace_root",
+            "repoRelative": "repo_relative",
+            "buildRoots": "build_roots",
+            "peanutReviewBin": "peanut_review_bin",
+            "runtimeRoot": "runtime_root",
+        }
+        for external, internal in aliases.items():
+            if external in raw:
+                raw.setdefault(internal, raw.pop(external))
+        return cls(**{k: v for k, v in raw.items() if k in cls.__dataclass_fields__})
 
 
 @dataclass
@@ -94,7 +134,6 @@ class Comment:
     end_line: int | None = None
     side: str = "right"
     body: str = ""
-    severity: str = Severity.SUGGESTION.value
     # GitHub review-level semantics. `approve` and `request-changes` are only
     # valid on top-level global comments; anchored comments and replies remain
     # ordinary review comments.
@@ -110,9 +149,10 @@ class Comment:
     deleted: bool = False
     deleted_by: str | None = None
     deleted_at: str | None = None
-    # Threading — replies point at a top-level comment id. Replies do not
-    # nest: setting reply_to on a reply silently re-roots to its parent's
-    # parent, so trees are at most one level deep (GitHub-style).
+    # Threading — replies point at a top-level anchored comment id. Global
+    # comments cannot have replies because GitHub does not support them.
+    # Replies do not nest: setting reply_to on a reply silently re-roots to
+    # its parent's parent, so trees are at most one level deep (GitHub-style).
     reply_to: str | None = None
     # External provenance — set when imported from or pushed to a remote
     # provider (currently only "github"). external_synced_body holds the body
@@ -125,7 +165,7 @@ class Comment:
     external_url: str | None = None
     external_in_reply_to: str | None = None
     external_synced_body: str | None = None
-    # Edit history — `versions` stacks prior {body, severity, edited_at,
+    # Edit history — `versions` stacks prior {body, category, edited_at,
     # edited_by} snapshots in chronological order (versions[0] is the
     # original creator's state). edited_at/edited_by reflect the most recent
     # edit, or None on a never-edited comment.
@@ -144,17 +184,23 @@ class Comment:
         d = json.loads(line)
         if "category" in d:
             d["category"] = normalize_comment_category(d["category"])
+        # Old sessions remain readable without exposing retired metadata.
+        if "versions" in d:
+            d["versions"] = [
+                {k: v for k, v in version.items() if k != "severity"}
+                for version in d["versions"]
+            ]
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
 @dataclass
 class Note:
-    """Free-form agent activity that is not review feedback.
+    """A non-review report from a reviewer or curator.
 
-    Notes are intentionally separate from comments: they have no severity,
+    Notes are intentionally separate from comments: they have no review
     category, file anchor, resolution state, or GitHub synchronization fields.
-    Use them for test execution reports and operational context that should be
-    visible in peanut-review but never pushed as PR review feedback.
+    Use them for reports such as test execution and comment curation that
+    should be visible in peanut-review but never pushed as PR review feedback.
     """
 
     id: str = field(default_factory=lambda: _short_id("n"))
@@ -177,7 +223,11 @@ class Note:
 class AgentConfig:
     name: str = ""
     model: str = ""
+    reasoning_effort: str = ""
+    # Per-run Codex fast-mode override. None uses peanut-review's off default.
+    fast_mode: bool | None = None
     persona: str = ""
+    role: str = AgentRole.REVIEWER.value
     status: str = AgentStatus.PENDING.value
     # Runtime identity. `pid` is the top-level reviewer process PID after the
     # runner wrapper has exec'd the real agent command. `pgid` is the process
@@ -189,14 +239,38 @@ class AgentConfig:
     # Backend runner: "cursor" (cursor-agent), "opencode" (opencode run),
     # or "codex" (codex exec).
     runner: str = "cursor"
+    # Optional name in Session.ssh_targets. Runner selection stays orthogonal:
+    # cursor/opencode/codex choose the model wrapper, ssh_target chooses where
+    # that wrapper runs.
+    ssh_target: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        return {k: v for k, v in d.items() if v is not None}
+        reasoning_effort = d.pop("reasoning_effort")
+        fast_mode = d.pop("fast_mode")
+        ssh_target = d.pop("ssh_target")
+        return (
+            {
+                k: v
+                for k, v in d.items()
+                if v is not None
+                and not (k == "role" and v == AgentRole.REVIEWER.value)
+            }
+            | ({"reasoningEffort": reasoning_effort} if reasoning_effort else {})
+            | ({"fastMode": fast_mode} if fast_mode is not None else {})
+            | ({"sshTarget": ssh_target} if ssh_target else {})
+        )
 
     @classmethod
     def from_dict(cls, d: dict) -> AgentConfig:
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+        raw = dict(d)
+        if "reasoningEffort" in raw:
+            raw.setdefault("reasoning_effort", raw.pop("reasoningEffort"))
+        if "fastMode" in raw:
+            raw.setdefault("fast_mode", raw.pop("fastMode"))
+        if "sshTarget" in raw:
+            raw.setdefault("ssh_target", raw.pop("sshTarget"))
+        return cls(**{k: v for k, v in raw.items() if k in cls.__dataclass_fields__})
 
 
 @dataclass
@@ -214,9 +288,14 @@ class GitHubPR:
     base_sha: str = ""
     title: str = ""
     head_ref_name: str = ""
+    # None means an older session did not capture the description; "" is empty.
+    body: str | None = None
 
     def to_dict(self) -> dict:
-        return {k: v for k, v in asdict(self).items() if v not in (None, "", 0)}
+        result = {k: v for k, v in asdict(self).items() if v not in (None, "", 0)}
+        if self.body is not None:
+            result["body"] = self.body
+        return result
 
     @classmethod
     def from_dict(cls, d: dict) -> GitHubPR:
@@ -228,7 +307,12 @@ class Session:
     version: int = 1
     id: str = ""
     created_at: str = field(default_factory=_now_iso)
+    # Agent launch/workspace root. For nested checkouts, repo_relative points
+    # at the Git repository under this directory.
     workspace: str = ""
+    repo_relative: str = ""
+    # Durable object storage, independent of the agent's recyclable checkout.
+    git_common_dir: str = ""
     base_ref: str = "main"
     topic_ref: str = "HEAD"
     original_head: str = ""
@@ -236,13 +320,31 @@ class Session:
     diff_commands: list[str] = field(default_factory=list)
     diff_stat: str = ""
     agents: list[AgentConfig] = field(default_factory=list)
-    state: str = SessionState.INIT.value
+    ssh_targets: dict[str, SshTarget] = field(default_factory=dict)
     timeout: int = 1200
     github: GitHubPR | None = None
+    # Comment id used as the lower bound for the next curator run. Reviewer
+    # launch/rerun updates this so the curator can focus on fresh findings.
+    curation_since_comment_id: str | None = None
+    # Start time of the most recent successful local-comment push to GitHub.
+    # This is a creation-time watermark: comments deliberately omitted from
+    # that push are older than it, while comments added afterward are newer.
+    last_github_push_at: str | None = None
+
+    def repo_path(self) -> str:
+        if not self.repo_relative or self.repo_relative == ".":
+            return self.workspace
+        return str((Path(self.workspace) / self.repo_relative).resolve())
 
     def to_json(self) -> str:
         d = asdict(self)
         d["agents"] = [a.to_dict() for a in self.agents]
+        d["sshTargets"] = {
+            name: target.to_dict() for name, target in self.ssh_targets.items()
+        }
+        d.pop("ssh_targets", None)
+        if not d["sshTargets"]:
+            d.pop("sshTargets")
         if self.github is not None:
             d["github"] = self.github.to_dict()
         else:
@@ -254,44 +356,18 @@ class Session:
     def from_json(cls, text: str) -> Session:
         d = json.loads(text)
         agents = [AgentConfig.from_dict(a) for a in d.pop("agents", [])]
+        ssh_targets = {
+            name: SshTarget.from_dict(target)
+            for name, target in d.pop("sshTargets", {}).items()
+        }
         gh_raw = d.pop("github", None)
         filtered = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
         s = cls(**filtered)
         s.agents = agents
+        s.ssh_targets = ssh_targets
         if gh_raw:
             s.github = GitHubPR.from_dict(gh_raw)
         return s
-
-
-@dataclass
-class Question:
-    id: str = ""
-    agent: str = ""
-    timestamp: str = field(default_factory=_now_iso)
-    question: str = ""
-
-    def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2)
-
-    @classmethod
-    def from_json(cls, text: str) -> Question:
-        d = json.loads(text)
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
-
-
-@dataclass
-class Reply:
-    answered_by: str = "orchestrator"
-    timestamp: str = field(default_factory=_now_iso)
-    answer: str = ""
-
-    def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2)
-
-    @classmethod
-    def from_json(cls, text: str) -> Reply:
-        d = json.loads(text)
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
 @dataclass

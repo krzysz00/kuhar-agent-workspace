@@ -11,13 +11,73 @@ Two phases so the UI can preview before committing:
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import hashlib
 from pathlib import Path
+import re
+import subprocess
 
 from . import gh, models, session as sess, store
 
 
-DEFAULT_REVIEW_BODY = "A few comments"
+DEFAULT_DIFF_CONTEXT = 3
+
+
+_SINGLE_INLINE_NEUTRAL_TEMPLATES = (
+    "Just one comment",
+    "One thing I noticed",
+    "Left one note to consider",
+)
+
+_INLINE_NEUTRAL_TEMPLATES = (
+    "Just {comments}",
+    "Left {inline_comments}",
+    "Added {comments}",
+)
+
+_MIXED_NEUTRAL_TEMPLATES = (
+    "{comments_cap}, plus {replies}",
+    "Left {replies} and {new_comments}",
+    "Added {comments} and {replies}",
+)
+
+
+@dataclass(frozen=True)
+class AnchorPromotion:
+    """A local inline anchor that cannot be submitted as a GitHub review item."""
+
+    comment_id: str
+    original_file: str
+    original_line: int
+    original_end_line: int | None = None
+    reason: str = "outside GitHub review diff"
+
+    @property
+    def ref(self) -> str:
+        if self.original_end_line and self.original_end_line != self.original_line:
+            lo, hi = sorted((self.original_line, self.original_end_line))
+            return f"{self.original_file}:{lo}-{hi}"
+        return f"{self.original_file}:{self.original_line}"
+
+
+@dataclass(frozen=True)
+class ReviewAnchorIndex:
+    """New-side lines that GitHub can accept as review-comment anchors."""
+
+    lines_by_path: dict[str, set[int]]
+    error: str | None = None
+
+    def can_anchor(self, c: models.Comment) -> bool:
+        if self.error is not None:
+            return True
+        if c.file == sess.GLOBAL_FILE:
+            return True
+        lines = self.lines_by_path.get(c.file)
+        if lines is None:
+            return False
+        end = c.end_line if c.end_line is not None else c.line
+        lo, hi = (c.line, end) if c.line <= end else (end, c.line)
+        return all(line in lines for line in range(lo, hi + 1))
 
 
 @dataclass
@@ -27,6 +87,8 @@ class PushPlan:
     edits: list[models.Comment] = field(default_factory=list)
     skipped_meta: int = 0
     skipped_imported_reviews: int = 0
+    anchor_validation_error: str | None = None
+    promoted_anchors: dict[str, AnchorPromotion] = field(default_factory=dict)
     # local_id → external_id, seeded from already-pushed comments.
     ext_map: dict[str, str] = field(default_factory=dict)
 
@@ -50,11 +112,14 @@ class PushResult:
     pushed: int = 0
     failed: int = 0
     orphaned: int = 0
+    promoted: int = 0
     skipped_meta: int = 0
     skipped_imported_reviews: int = 0
 
     def summary(self) -> str:
         parts = [f"Pushed {self.pushed}"]
+        if self.promoted:
+            parts.append(f"promoted {self.promoted} to global")
         if self.failed:
             parts.append(f"failed {self.failed}")
         if self.orphaned:
@@ -66,7 +131,97 @@ class PushResult:
         return ", ".join(parts) + "."
 
 
-def plan_push(comments: list[models.Comment]) -> PushPlan:
+_HUNK_RE = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def build_review_anchor_index(
+    repo_path: str | Path,
+    base_ref: str,
+    topic_ref: str,
+    *,
+    context: int = DEFAULT_DIFF_CONTEXT,
+) -> ReviewAnchorIndex:
+    """Build the GitHub-style new-side review-anchor line set.
+
+    The main renderer intentionally uses full-file context so humans can see
+    local comments anywhere in a changed file. GitHub review comments are more
+    restrictive: anchors must land on new-side lines that appear in the review
+    diff hunk. Use a normal unified diff here so planning catches those anchors
+    before the create-review API rejects the batch.
+    """
+    result = subprocess.run(
+        [
+            "git", "-C", str(repo_path),
+            "diff", f"-U{context}", "--no-color",
+            f"{base_ref}...{topic_ref}",
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        if not detail:
+            detail = f"git diff exited {result.returncode}"
+        return ReviewAnchorIndex({}, error=detail)
+
+    lines_by_path: dict[str, set[int]] = {}
+    current_path: str | None = None
+    new_ln = 0
+    for line in result.stdout.splitlines():
+        if line.startswith("diff --git"):
+            current_path = None
+            continue
+        if line.startswith("--- "):
+            continue
+        if line.startswith("+++ "):
+            raw_path = line[4:].strip()
+            if raw_path == "/dev/null":
+                current_path = None
+                continue
+            current_path = raw_path[2:] if raw_path.startswith("b/") else raw_path
+            lines_by_path.setdefault(current_path, set())
+            continue
+        if line.startswith("@@"):
+            m = _HUNK_RE.match(line)
+            if m:
+                new_ln = int(m.group(1))
+            continue
+        if current_path is None:
+            continue
+        if line.startswith("\\"):
+            continue
+        if line.startswith("+"):
+            lines_by_path[current_path].add(new_ln)
+            new_ln += 1
+        elif line.startswith("-"):
+            continue
+        else:
+            lines_by_path[current_path].add(new_ln)
+            new_ln += 1
+
+    return ReviewAnchorIndex(lines_by_path)
+
+
+def _promoted_body(c: models.Comment, promotion: AnchorPromotion) -> str:
+    body = c.body.strip()
+    prefix = f"Original anchor: `{promotion.ref}`"
+    return f"{prefix}\n\n{body}" if body else prefix
+
+
+def _promote_comment(c: models.Comment, promotion: AnchorPromotion) -> models.Comment:
+    return replace(
+        c,
+        file=sess.GLOBAL_FILE,
+        line=0,
+        end_line=None,
+        body=_promoted_body(c, promotion),
+    )
+
+
+def plan_push(
+    comments: list[models.Comment],
+    *,
+    anchor_index: ReviewAnchorIndex | None = None,
+) -> PushPlan:
     """Classify live comments into push buckets.
 
     - external_id is None → new (top-level or reply by reply_to)
@@ -77,6 +232,8 @@ def plan_push(comments: list[models.Comment]) -> PushPlan:
       GitHub review object exists
     """
     plan = PushPlan()
+    if anchor_index is not None:
+        plan.anchor_validation_error = anchor_index.error
     for c in comments:
         c.category = models.normalize_comment_category(c.category)
         if c.deleted:
@@ -91,6 +248,20 @@ def plan_push(comments: list[models.Comment]) -> PushPlan:
             plan.skipped_meta += 1
             continue
         if c.external_id is None:
+            if (
+                anchor_index is not None
+                and not c.reply_to
+                and c.file != sess.GLOBAL_FILE
+                and not anchor_index.can_anchor(c)
+            ):
+                promotion = AnchorPromotion(
+                    comment_id=c.id,
+                    original_file=c.file,
+                    original_line=c.line,
+                    original_end_line=c.end_line,
+                )
+                plan.promoted_anchors[c.id] = promotion
+                c = _promote_comment(c, promotion)
             (plan.new_replies if c.reply_to else plan.new_top).append(c)
         elif c.body != (c.external_synced_body or ""):
             plan.edits.append(c)
@@ -109,6 +280,12 @@ def filter_plan(plan: PushPlan, comment_ids: set[str]) -> PushPlan:
         edits=[c for c in plan.edits if c.id in comment_ids],
         skipped_meta=plan.skipped_meta,
         skipped_imported_reviews=plan.skipped_imported_reviews,
+        anchor_validation_error=plan.anchor_validation_error,
+        promoted_anchors={
+            cid: promotion
+            for cid, promotion in plan.promoted_anchors.items()
+            if cid in comment_ids
+        },
         ext_map=dict(plan.ext_map),
     )
 
@@ -132,6 +309,182 @@ def _review_comment_payload(c: models.Comment) -> dict:
 def _review_body(global_comments: list[models.Comment]) -> str:
     """Fold selected global comments into one GitHub review summary."""
     return "\n\n".join(c.body.strip() for c in global_comments if c.body.strip())
+
+
+def _capitalize(text: str) -> str:
+    return text[:1].upper() + text[1:]
+
+
+def _stable_choice(
+    choices: tuple[str, ...],
+    inline_comments: list[models.Comment],
+    replies: list[models.Comment],
+    *,
+    salt: str,
+) -> str:
+    """Vary wording per push while keeping retries reproducible."""
+    identities = [f"comment:{c.id}" for c in inline_comments]
+    identities.extend(f"reply:{c.id}" for c in replies)
+    material = "\0".join([salt, *sorted(identities)])
+    digest = hashlib.sha256(material.encode()).digest()
+    return choices[int.from_bytes(digest[:8], "big") % len(choices)]
+
+
+def _count_phrase(
+    count: int,
+    *,
+    one: str,
+    exact: str,
+    few: tuple[str, ...],
+    several: tuple[str, ...],
+    many: tuple[str, ...],
+    inline_comments: list[models.Comment],
+    replies: list[models.Comment],
+    salt: str,
+) -> str:
+    if count == 1:
+        return one
+    if count <= 4:
+        choices = (*few, exact.format(count=count))
+    elif count <= 7:
+        choices = (*few, *several, exact.format(count=count))
+    elif count <= 9:
+        choices = several
+    else:
+        choices = many
+    return _stable_choice(
+        choices, inline_comments, replies, salt=f"quantity:{salt}",
+    )
+
+
+def _stable_template(
+    templates: tuple[str, ...],
+    inline_comments: list[models.Comment],
+    replies: list[models.Comment],
+) -> str:
+    return _stable_choice(
+        templates, inline_comments, replies, salt="review-template",
+    )
+
+
+def _default_review_body(
+    inline_comments: list[models.Comment],
+    replies: list[models.Comment],
+) -> str:
+    """Describe an inline-only push with count-aware, varied wording."""
+    comment_count = len(inline_comments)
+    if comment_count == 0:
+        return ""
+
+    if comment_count == 1 and not replies:
+        return _stable_template(
+            _SINGLE_INLINE_NEUTRAL_TEMPLATES, inline_comments, replies,
+        )
+
+    def count_phrase(
+        salt: str,
+        *,
+        one: str,
+        exact: str,
+        few: tuple[str, ...],
+        several: tuple[str, ...],
+        many: tuple[str, ...],
+        count: int = comment_count,
+    ) -> str:
+        return _count_phrase(
+            count,
+            one=one,
+            exact=exact,
+            few=few,
+            several=several,
+            many=many,
+            inline_comments=inline_comments,
+            replies=replies,
+            salt=salt,
+        )
+
+    comments = count_phrase(
+        "comments",
+        one="one comment",
+        exact="{count} comments",
+        few=("a few comments", "some comments"),
+        several=("several comments", "a handful of comments"),
+        many=(
+            "a bunch of comments",
+            "quite a few comments",
+            "a number of comments",
+        ),
+    )
+    inline_comment_phrase = count_phrase(
+        "inline-comments",
+        one="one inline comment",
+        exact="{count} inline comments",
+        few=("a few inline comments", "some inline comments"),
+        several=("several inline comments", "a handful of inline comments"),
+        many=(
+            "a bunch of inline comments",
+            "quite a few inline comments",
+            "a number of inline comments",
+        ),
+    )
+    new_comments = count_phrase(
+        "new-comments",
+        one="a new comment",
+        exact="{count} new comments",
+        few=("a few new comments", "some new comments"),
+        several=("several new comments", "a handful of new comments"),
+        many=(
+            "a bunch of new comments",
+            "quite a few new comments",
+            "a number of new comments",
+        ),
+    )
+    values = {
+        "comments": comments,
+        "comments_cap": _capitalize(comments),
+        "inline_comments": inline_comment_phrase,
+        "new_comments": new_comments,
+    }
+
+    if not replies:
+        template = _stable_template(
+            _INLINE_NEUTRAL_TEMPLATES, inline_comments, replies,
+        )
+        return template.format(**values)
+
+    reply_phrase = count_phrase(
+        "inline-replies",
+        count=len(replies),
+        one="an inline reply",
+        exact="{count} inline replies",
+        few=("a few inline replies", "some inline replies"),
+        several=("several inline replies", "a handful of inline replies"),
+        many=(
+            "a bunch of inline replies",
+            "quite a few inline replies",
+            "a number of inline replies",
+        ),
+    )
+    values.update({
+        "replies": reply_phrase,
+    })
+    template = _stable_template(_MIXED_NEUTRAL_TEMPLATES, inline_comments, replies)
+    return template.format(**values)
+
+
+def _replies_described_by_review(
+    plan: PushPlan,
+    inline_comments: list[models.Comment],
+) -> list[models.Comment]:
+    """Return replies whose parent is available to this push."""
+    available_parent_ids = set(plan.ext_map)
+    available_parent_ids.update(c.id for c in inline_comments)
+    return [
+        c for c in plan.new_replies
+        if c.file != sess.GLOBAL_FILE
+        and c.reply_to not in plan.promoted_anchors
+        and c.reply_to in available_parent_ids
+    ]
 
 
 def _review_event(global_comments: list[models.Comment]) -> str:
@@ -224,6 +577,15 @@ def execute_push(
         skipped_meta=plan.skipped_meta,
         skipped_imported_reviews=plan.skipped_imported_reviews,
     )
+    push_started_at = models._now_iso()
+    push_recorded = False
+
+    def record_push() -> None:
+        nonlocal push_recorded
+        if not push_recorded:
+            sess.record_github_push(session_dir, push_started_at)
+            push_recorded = True
+
     ext_map = dict(plan.ext_map)  # local copy — don't mutate caller's
 
     inline_top = [c for c in plan.new_top if c.file != sess.GLOBAL_FILE]
@@ -232,7 +594,9 @@ def execute_push(
     review_event = _review_event(global_top)
     inline_payloads = [_review_comment_payload(c) for c in inline_top]
     if review_event == "COMMENT" and not review_body:
-        review_body = DEFAULT_REVIEW_BODY
+        review_body = _default_review_body(
+            inline_top, _replies_described_by_review(plan, inline_top),
+        )
     created_inline: dict[str, dict] = {}
     review_id: str | None = None
     review_url = ""
@@ -252,6 +616,7 @@ def execute_push(
                 ))
             result.failed += len(plan.new_top)
         else:
+            record_push()
             review_id = str(resp["id"])
             review_url = resp.get("html_url", "")
             if inline_top:
@@ -274,24 +639,26 @@ def execute_push(
                     result.failed += len(inline_top)
 
             failed_new_ids = {i.id for i in result.items if i.error}
-            stamped_review_summary = False
             for c in plan.new_top:
                 if c.file == sess.GLOBAL_FILE:
-                    if not stamped_review_summary:
-                        store.update_comment_external(
-                            session_dir, c.id,
-                            external_source="github-review",
-                            external_id=review_id,
-                            external_url=review_url,
-                            external_synced_body=review_body,
-                        )
-                        stamped_review_summary = True
-                    store.delete_comment(session_dir, c.id, deleted_by="github-push")
+                    # GitHub folds every selected global comment into one
+                    # review body. Stamp each local component with that review
+                    # identity so it is not offered again, but keep the local
+                    # records visible in peanut-review.
+                    store.update_comment_external(
+                        session_dir, c.id,
+                        external_source="github-review",
+                        external_id=review_id,
+                        external_url=review_url,
+                        external_synced_body=review_body,
+                    )
                     result.items.append(PushItemResult(
                         id=c.id, action="new",
                         external_id=review_id, external_url=review_url,
                     ))
                     result.pushed += 1
+                    if c.id in plan.promoted_anchors:
+                        result.promoted += 1
                     continue
 
                 raw = created_inline.get(c.id)
@@ -319,6 +686,21 @@ def execute_push(
                 result.pushed += 1
 
     for c in plan.new_replies:
+        if c.file == sess.GLOBAL_FILE:
+            result.items.append(PushItemResult(
+                id=c.id,
+                action="reply",
+                error="GitHub does not support replies to global comments",
+            ))
+            result.failed += 1
+            continue
+        if c.reply_to in plan.promoted_anchors:
+            result.items.append(PushItemResult(
+                id=c.id, action="reply",
+                error="parent promoted to global; replies cannot be pushed",
+            ))
+            result.orphaned += 1
+            continue
         parent_ext = ext_map.get(c.reply_to or "")
         if not parent_ext:
             result.items.append(PushItemResult(
@@ -337,6 +719,7 @@ def execute_push(
             continue
         ext_id = str(resp["id"])
         url = resp.get("html_url", "")
+        record_push()
         store.update_comment_external(
             session_dir, c.id,
             external_source="github", external_id=ext_id,
@@ -359,6 +742,7 @@ def execute_push(
             result.items.append(PushItemResult(id=c.id, action="edit", error=str(e)))
             result.failed += 1
             continue
+        record_push()
         store.update_comment_external(
             session_dir, c.id,
             external_synced_body=c.body,

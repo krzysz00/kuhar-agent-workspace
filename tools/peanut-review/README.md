@@ -1,6 +1,6 @@
 # peanut-review
 
-Structured code review for humans and agents, with a CLI, JSONL session state,
+Structured code review for humans and agents, with a CLI, JSONL session data,
 and a browser UI.
 
 ## TL;DR
@@ -24,6 +24,29 @@ bin/peanut_review_serve.sh
 
 Defaults: `root=$HOME/reviews`, `url=http://127.0.0.1:27183/pr`.
 
+### Optional browser profiling
+
+The runtime has no browser dependency. For repeatable local performance
+measurements, install Playwright in a disposable virtual environment and run
+the optional profiler against either the direct server or the Caddy mount:
+
+```bash
+python -m venv /tmp/peanut-review-profiler
+/tmp/peanut-review-profiler/bin/pip install playwright
+/tmp/peanut-review-profiler/bin/playwright install chromium
+
+/tmp/peanut-review-profiler/bin/python scripts/profile_web.py \
+  --url http://127.0.0.1:27183/example-session/ \
+  --url http://127.0.0.1:27182/pr/example-session/ \
+  --runs 3 --output /tmp/peanut-review-profile.json
+```
+
+The JSON report records medians plus every run: response start,
+DOMContentLoaded, main-thread task, layout and style time, long tasks,
+transferred bytes, DOM shape, bottom-scroll cost, and steady-state polling
+bytes and CPU. Compare medians from the same machine, browser build, server
+mount, session snapshot, and run count.
+
 ## Copy/Paste Prompts
 
 First-time project setup:
@@ -41,8 +64,8 @@ GitHub PR orchestration:
 Set up peanut-review for <PR URL> under <review-root>. Use the existing
 .peanut-review.json, confirm the exact reviewer lineup and runner/model choices
 before launching, and start with --no-launch so I can build/test the checkout.
-After reviewers signal round-done, kill agents and help me curate feedback for
-the web UI push flow.
+After reviewers signal round-done, wait-all should run the curator; help me
+inspect the curated feedback for the web UI push flow.
 ```
 
 Local author-owned review:
@@ -60,7 +83,7 @@ Refresh an existing GitHub-backed session:
 Refresh peanut-review session <SESSION> after the PR changed. Prefer re-running
 gh pr co <PR> over manual git operations when updating the local checkout; use
 --force only if we intentionally want to discard local divergence. Then run
-gh-pull and migrate, and show new/unresolved comments. Do not launch agents
+sync-pr and gh-pull, and show new/unresolved comments. Do not launch agents
 unless the update is substantial or I explicitly ask.
 ```
 
@@ -80,13 +103,19 @@ or repo:
   "repoRelative": "my-repo",
   "reviewAgentTimeoutSeconds": 1200,
   "agents": [
-    {"name": "Vera", "model": "gpt-5.5", "persona": "vera.md", "runner": "codex"},
-    {"name": "Irene", "model": "claude-opus-4-7-thinking-medium", "persona": "irene.md", "runner": "cursor"}
+    {"name": "Vera", "model": "gpt-5.5", "reasoningEffort": "high", "fastMode": false, "persona": "vera.md", "runner": "codex"},
+    {"name": "Irene", "model": "claude-opus-4-7-thinking-medium", "persona": "irene.md", "runner": "cursor"},
+    {"name": "Curator", "model": "gpt-5.5-high", "runner": "cursor", "role": "curator"}
   ]
 }
 ```
 
 Supported runners: `cursor`, `opencode`, `codex`.
+Codex agents accept an optional per-agent `fastMode` boolean. It defaults to
+`false`; set it to `true` to enable Codex fast mode for a specific agent.
+GitHub PR sessions require a configured agent with `"role": "curator"` because
+the curator model is intentionally owned by project config, not by Python
+defaults.
 
 Cursor runners need permissions in the reviewed workspace before `launch`:
 
@@ -96,9 +125,27 @@ cp "$PEANUT_REVIEW_DIR/peanut_review/templates/cli.sample.json" \
   "$WORKSPACE/.cursor/cli.json"
 ```
 
+Cursor prompts include the shared user guidance from `~/.codex/AGENTS.md`
+(or `$CODEX_HOME/AGENTS.md`) when present. This is loaded on each launch before
+Cursor switches to its private runtime home; `~/` paths in the guidance are
+expanded to the user's actual home so reference checkouts remain discoverable.
+SSH Cursor reviewers use the remote user's guidance and home directory.
+
+Selected reviewer agents can instead use an existing persistent SSH
+ControlMaster, an independent remote checkout/build tree, and a reverse-forwarded
+capability gateway while retaining the same reviewer CLI. Curator, web, and
+GitHub operations remain local. See [SSH reviewers](docs/ssh-reviewers.md) for
+the configuration, security boundary, lifecycle, and real localhost validation.
+
 ## Flow: GitHub PR
 
 Use this for changes that came from GitHub.
+
+PR setup saves the title, URL, and full description in `session.json`. The
+default reviewer and Curator prompts include that context directly, including
+for SSH reviewers, so agents do not need to fetch it. `start --reuse --sync`
+(used by `review-pr.sh`) and `sync-pr` refresh the description for the next
+launch. Custom prompt templates can include it with `${PR_CONTEXT}`.
 
 ```bash
 PR=https://github.com/owner/repo/pull/123
@@ -122,10 +169,15 @@ SESSION=<printed-session-path>
 "$PR_BIN" --session "$SESSION" launch --dry-run
 "$PR_BIN" --session "$SESSION" launch
 "$PR_BIN" --session "$SESSION" wait-all round-done --timeout 900
-"$PR_BIN" --session "$SESSION" kill-agents
 ```
 
-Curate in the web UI, then use the UI's GitHub push modal when ready:
+`wait-all round-done` emits `::group::Reviewers` and `::group::Curator` log
+markers as it enters those phases, closing each with `::endgroup::` on success.
+A failed phase remains open so a calling queue can attribute the failure.
+
+For GitHub-backed sessions, `wait-all round-done` waits for reviewers, then
+launches the dedicated `Curator` agent and waits for it to finish. Inspect the
+curated result in the web UI, then use the UI's GitHub push modal when ready:
 
 ```bash
 "$PR_BIN" --session "$SESSION" gh-pull
@@ -133,6 +185,31 @@ Curate in the web UI, then use the UI's GitHub push modal when ready:
 "$PR_BIN" --session "$SESSION" edit c_1234abcd --body-file /tmp/comment.md
 "$PR_BIN" --session "$SESSION" delete c_9999ffff
 ```
+
+The curator prepares an `approve` review with `LGTM` when all existing
+non-nit findings are addressed and the completed review of the current head
+finds no new substantive issues. Tiny, optional nits do not block approval.
+The curator previews the review with `gh-push --dry-run`; publication remains
+with the user or orchestrator.
+
+`wait-all round-done --max-reviewer-failures N` tolerates up to N reviewers
+finishing without a `round-done` signal. It waits for every reviewer to finish
+before curation, reports the failed reviewers, and still fails if any reviewer
+remains unfinished at the deadline or Curator fails. At least one reviewer must
+succeed. The default is zero tolerated failures; the RocJITsu `review-pr.sh`
+launcher allows up to half of its configured reviewers (rounded down).
+
+When **curate** needs a checkout that was recycled or has moved to another
+commit, it restores the pinned commit from retained Git storage into
+`<session>/curator-workspaces/<commit>/repo`. The saved diff, comments, and PR
+identity stay unchanged. The replacement contains source and runner config;
+build outputs and virtual environments are not restored. Retargeting is blocked
+while session agents are still running. A legacy session without retained Git
+storage must first use `retain-git --repo <surviving-repository>`.
+
+The web UI also exposes manual **curate** and **rerun all** controls in the
+Agents section when you need to rerun comment curation or start a fresh
+reviewer pass.
 
 ## Flow: Local Branch
 
@@ -145,7 +222,8 @@ SESSION=$REVIEW_ROOT/my-repo-my-branch
 WORKSPACE=$PWD
 AGENTS='[
   {"name":"Vera","model":"gpt-5.5","persona":"vera.md","runner":"codex"},
-  {"name":"Irene","model":"claude-opus-4-7-thinking-medium","persona":"irene.md","runner":"cursor"}
+  {"name":"Irene","model":"claude-opus-4-7-thinking-medium","persona":"irene.md","runner":"cursor"},
+  {"name":"Curator","model":"gpt-5.5-high","runner":"cursor","role":"curator"}
 ]'
 
 "$PR_BIN" --session "$SESSION" init \
@@ -160,6 +238,13 @@ AGENTS='[
 "$PR_BIN" --session "$SESSION" comments --unresolved
 ```
 
+Local sessions do not run the curator automatically. If you want comment
+cleanup before fixing the patch, use the web UI's **curate** button or:
+
+```bash
+"$PR_BIN" --session "$SESSION" curate
+```
+
 After fixing code:
 
 ```bash
@@ -168,7 +253,7 @@ COMMENT_ID=c_1234abcd
 
 "$PR_BIN" --session "$SESSION" resolve "$COMMENT_ID"
 "$PR_BIN" --session "$SESSION" migrate
-"$PR_BIN" --session "$SESSION" signal-all next-round
+"$PR_BIN" --session "$SESSION" rerun --agent Vera --agent Irene
 "$PR_BIN" --session "$SESSION" wait-all round-done --timeout 900
 "$PR_BIN" --session "$SESSION" verdict --approve --body "All critical issues addressed"
 ```
@@ -182,28 +267,63 @@ Use this after the author pushes a new revision.
 # PR branch in place. Use --force only to intentionally discard local divergence.
 gh pr co "$PR"
 
+"$PR_BIN" --session "$SESSION" sync-pr
 "$PR_BIN" --session "$SESSION" gh-pull
-"$PR_BIN" --session "$SESSION" migrate
 "$PR_BIN" --session "$SESSION" comments --since "$LAST_COMMENT_ID"
 ```
 
-Relaunch agents only for substantial changes:
+Session base/head refs are stored as commit SHAs. Opening the web UI never
+retargets them: if the checkout has moved, the page reports that the workspace
+differs until `sync-pr` (GitHub sessions) or `migrate` (local sessions) is run
+explicitly. Agent launch/rerun is refused for a GitHub session while its
+workspace is checked out at a different commit.
+
+New and synchronized sessions record `git_common_dir` separately from the
+execution `workspace` and `repo_relative`. Pinned diffs, folded source context,
+and GitHub comment anchors read the shared Git directory, so linked worktrees
+can be recycled without breaking saved reviews. Session-specific refs under
+`refs/peanut-review/` retain reviewed commits, including earlier revisions,
+against Git garbage collection. Keep the shared repository available; these
+refs are not automatically pruned when session directories are deleted.
+
+To repair an older session whose worktree has already been removed, supply a
+surviving repository containing its recorded commits:
 
 ```bash
-"$PR_BIN" --session "$SESSION" launch
+"$PR_BIN" --session "$SESSION" retain-git --repo /path/to/main/repository
+```
+
+This updates durable Git storage without changing the execution workspace,
+reviewed commits, comments, or agent configuration. Reviewer reruns still need
+a valid execution checkout; synchronize a replacement workspace before rerunning.
+
+Rerun agents only for substantial changes. Use `rerun`, not `launch`, so stale
+round signals are cleared before the selected reviewers start:
+
+```bash
+"$PR_BIN" --session "$SESSION" rerun --agent Vera --agent Irene
 "$PR_BIN" --session "$SESSION" wait-all round-done --timeout 900
-"$PR_BIN" --session "$SESSION" kill-agents
 ```
 
 ## Common Commands
 
 ```bash
 "$PR_BIN" --session "$SESSION" status
-"$PR_BIN" --session "$SESSION" inbox
-"$PR_BIN" --session "$SESSION" reply --agent Vera --id q_1234abcd "Use ninja check-foo."
 "$PR_BIN" --session "$SESSION" note --message "Ran targeted tests; passed."
-"$PR_BIN" --session "$SESSION" add-comment --file path/to/file.py --line 42 --severity warning --body-file /tmp/body.md
+"$PR_BIN" --session "$SESSION" add-comment --file path/to/file.py --line 42 --body-file /tmp/body.md
 "$PR_BIN" --session "$SESSION" comments --unresolved   # use this to find c_... ids
-"$PR_BIN" --session "$SESSION" add-global-comment --severity suggestion --body "A few comments."
+"$PR_BIN" --session "$SESSION" curate                 # launch the comment curator
+"$PR_BIN" --session "$SESSION" add-global-comment --body "A few comments."
 "$PR_BIN" --session "$SESSION" add-global-comment --category request-changes --body-file /tmp/blocking.md
 ```
+
+`note` is a report-only channel for non-review output such as test execution
+and comment curation. Review findings and discussion belong in comments.
+Review progress is derived from reviewer and Curator runtime status. Sessions
+do not have a separate lifecycle state: `round-done` records an agent's
+completion, while `result.json` records an optional verdict without preventing
+later reruns.
+There is no interactive agent help channel: blocked reviewers record a
+`Review Blocked` report when possible, exit without `round-done`, and are
+rerun after the environment is fixed. Comment-thread replies remain available
+through `add-comment --reply-to`.

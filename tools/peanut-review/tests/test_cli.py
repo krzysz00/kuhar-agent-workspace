@@ -3,13 +3,16 @@ import io
 import json
 import os
 import shlex
+import subprocess
 import tempfile
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from peanut_review.cli import main
-from peanut_review import session as sess, models
+from peanut_review import session as sess, models, store
 
 
 def test_default_personas_dir_is_bundled():
@@ -19,6 +22,50 @@ def test_default_personas_dir_is_bundled():
     assert personas.name == "personas"
     assert personas.parent.name == "peanut_review"
     assert (personas / "vera.md").exists()
+
+
+@pytest.mark.parametrize("command", [
+    ["add-comment", "--global", "--body", "finding"],
+    ["add-global-comment", "--body", "finding"],
+    ["comments"],
+    ["edit", "c_existing", "--body", "updated"],
+])
+def test_removed_severity_flag_is_rejected(command, capsys):
+    with pytest.raises(SystemExit) as exc:
+        main([*command, "--severity", "warning"])
+    assert exc.value.code == 2
+    assert "unrecognized arguments: --severity warning" in capsys.readouterr().err
+
+
+def test_comments_reads_legacy_session_without_severity(tmp_path, capsys):
+    session_dir = str(tmp_path / "session")
+    _init_session(session_dir)
+    capsys.readouterr()
+    path = Path(session_dir) / "comments" / "vera.jsonl"
+    original = json.dumps({
+        "id": "c_legacy", "author": "vera", "body": "Current explanation",
+        "file": "foo.py", "line": 2, "severity": "critical", "resolved": True,
+        "versions": [{"body": "Earlier explanation", "severity": "nit"}],
+    }) + "\n"
+    path.write_text(original)
+
+    assert main(["--session", session_dir, "comments", "--format", "json"]) == 0
+    [comment] = json.loads(capsys.readouterr().out)
+    assert comment["body"] == "Current explanation"
+    assert comment["resolved"] is True
+    assert comment["versions"] == [{"body": "Earlier explanation"}]
+    assert "severity" not in comment
+    assert path.read_text() == original
+
+
+def test_babysitting_commands_are_not_registered():
+    from peanut_review import cli
+
+    parser = cli.build_parser()
+    commands = next(action.choices for action in parser._actions
+                    if action.dest == "command")
+
+    assert {"ask", "inbox", "reply"}.isdisjoint(commands)
 
 
 def _make_workspace(files: dict[str, str] | None = None) -> str:
@@ -45,8 +92,31 @@ def _make_cursor_workspace() -> str:
     return str(ws)
 
 
+def _git(cwd: str | Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
+def _make_git_repo() -> Path:
+    repo = Path(tempfile.mkdtemp(prefix="pr-git-"))
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "foo.py").write_text("x = 1\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    return repo
+
+
 def _mock_git(workspace, *args):
-    if args == ("rev-parse", "HEAD"):
+    if args == ("rev-parse", "--path-format=absolute", "--git-common-dir"):
+        return "/tmp/fakerepo/.git"
+    if args[:2] == ("rev-parse", "--verify"):
         return "abc123def456789"
     if args[0] == "diff" and "--stat" in args:
         return "+42 -10 3 files"
@@ -54,7 +124,9 @@ def _mock_git(workspace, *args):
 
 
 def _mock_git_empty_diff(workspace, *args):
-    if args == ("rev-parse", "HEAD"):
+    if args == ("rev-parse", "--path-format=absolute", "--git-common-dir"):
+        return "/tmp/fakerepo/.git"
+    if args[:2] == ("rev-parse", "--verify"):
         return "abc123def456789"
     if args[0] == "diff" and "--stat" in args:
         return ""
@@ -164,6 +236,32 @@ def test_launch_dry_run_notes_die_with_parent_sandbox_but_runs():
     assert "vera: dry-run" in text
 
 
+def test_curate_cli_launches_curator():
+    sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
+    _init_session(sd, workspace=_make_cursor_workspace(), agents=[
+        {"name": "vera", "model": "opus", "persona": "vera.md"},
+        {
+            "name": "Curator", "model": "gpt-5.5-high",
+            "role": "curator",
+        },
+    ])
+
+    def fake_launch_curator(session_dir, **kwargs):
+        assert session_dir == sd
+        assert kwargs["dry_run"] is True
+        return [{"name": "Curator", "supervisor_pid": None}]
+
+    out = io.StringIO()
+    with (
+        patch("peanut_review.launch.launch_curator", side_effect=fake_launch_curator),
+        redirect_stdout(out),
+    ):
+        rc = main(["--session", sd, "curate", "--dry-run"])
+
+    assert rc == 0
+    assert "Curator: dry-run" in out.getvalue()
+
+
 def test_rerun_dry_run_targets_agent_without_clearing_signals():
     from peanut_review import polling
 
@@ -181,6 +279,201 @@ def test_rerun_dry_run_targets_agent_without_clearing_signals():
     assert rc == 0
     assert "irene: dry-run" in out.getvalue()
     assert (Path(sd) / "signals" / "irene.round-done").exists()
+
+
+def test_wait_all_github_round_done_auto_launches_curator():
+    from peanut_review import polling
+
+    sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
+    with patch("peanut_review.session._run_git", side_effect=_mock_git):
+        sess.create_session(
+            workspace=_make_cursor_workspace(),
+            agents=[
+                {"name": "vera", "model": "opus", "persona": "vera.md"},
+                {
+                    "name": "Curator", "model": "gpt-5.5-high",
+                    "role": "curator",
+                },
+            ],
+            session_dir=sd,
+            github=models.GitHubPR(repo="acme/repo", number=42),
+            include_curator=True,
+        )
+    polling.write_signal(sd, "vera", "round-done")
+
+    def fake_launch_curator(session_dir, **_kwargs):
+        assert session_dir == sd
+        polling.write_signal(sd, "Curator", "round-done")
+        return [{"name": "Curator", "supervisor_pid": 12345}]
+
+    out = io.StringIO()
+    with (
+        patch("peanut_review.launch.launch_curator", side_effect=fake_launch_curator) as mocked,
+        redirect_stdout(out),
+    ):
+        rc = main(["--session", sd, "wait-all", "round-done", "--timeout", "1", "--poll", "0.01"])
+
+    assert rc == 0
+    mocked.assert_called_once_with(sd)
+    text = out.getvalue()
+    assert "All reviewers signaled round-done" in text
+    assert "Curator: supervisor=12345" in text
+    assert "Curator signaled round-done" in text
+
+
+def test_wait_all_github_round_done_errors_without_configured_curator():
+    from peanut_review import polling
+
+    sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
+    with patch("peanut_review.session._run_git", side_effect=_mock_git):
+        sess.create_session(
+            workspace=_make_cursor_workspace(),
+            agents=[{"name": "vera", "model": "opus", "persona": "vera.md"}],
+            session_dir=sd,
+            github=models.GitHubPR(repo="acme/repo", number=42),
+        )
+    polling.write_signal(sd, "vera", "round-done")
+
+    err = io.StringIO()
+    with redirect_stderr(err):
+        rc = main(["--session", sd, "wait-all", "round-done", "--timeout", "1", "--poll", "0.01"])
+
+    assert rc == 1
+    assert "curator agent is not configured" in err.getvalue()
+
+
+def test_wait_all_no_curate_skips_github_curator():
+    from peanut_review import polling
+
+    sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
+    with patch("peanut_review.session._run_git", side_effect=_mock_git):
+        sess.create_session(
+            workspace=_make_cursor_workspace(),
+            agents=[
+                {"name": "vera", "model": "opus", "persona": "vera.md"},
+                {
+                    "name": "Curator", "model": "gpt-5.5-high",
+                    "role": "curator",
+                },
+            ],
+            session_dir=sd,
+            github=models.GitHubPR(repo="acme/repo", number=42),
+            include_curator=True,
+        )
+    polling.write_signal(sd, "vera", "round-done")
+
+    with patch("peanut_review.launch.launch_curator") as mocked:
+        rc = main([
+            "--session", sd, "wait-all", "round-done",
+            "--timeout", "1", "--poll", "0.01", "--no-curate",
+        ])
+
+    assert rc == 0
+    mocked.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "count, failures, allowed, unfinished, curator_fails, expected",
+    [
+        (4, 0, 2, False, False, 0),
+        (4, 1, 2, False, False, 0),
+        (4, 2, 2, False, False, 0),
+        (4, 3, 2, False, False, 1),
+        (3, 1, 1, False, False, 0),
+        (3, 2, 1, False, False, 1),
+        (1, 1, 0, False, False, 1),
+        (4, 1, 0, False, False, 1),
+        (4, 2, 2, True, False, 1),
+        (4, 2, 2, False, True, 1),
+        (4, 4, 4, False, False, 1),
+    ],
+)
+def test_wait_all_reviewer_failure_budget(
+    tmp_path, capsys, count, failures, allowed, unfinished, curator_fails, expected,
+):
+    from peanut_review import polling, runtime
+
+    sd = str(tmp_path / "session")
+    with patch("peanut_review.session._run_git", side_effect=_mock_git):
+        sess.create_session(
+            workspace=_make_cursor_workspace(),
+            agents=[{"name": f"reviewer{i}", "model": "test"} for i in range(count)]
+            + [{"name": "Curator", "model": "test", "role": "curator"}],
+            session_dir=sd,
+            github=models.GitHubPR(repo="acme/repo", number=42),
+            include_curator=True,
+        )
+    for i in range(count):
+        if i < failures:
+            runtime.update_agent_meta(sd, f"reviewer{i}", {"exit_code": 1})
+        elif not (unfinished and i == count - 1):
+            polling.write_signal(sd, f"reviewer{i}", "round-done")
+
+    def curate(session_dir):
+        if curator_fails:
+            runtime.update_agent_meta(session_dir, "Curator", {"exit_code": 1})
+        else:
+            polling.write_signal(session_dir, "Curator", "round-done")
+        return [{"name": "Curator", "supervisor_pid": 12345}]
+
+    with patch("peanut_review.launch.launch_curator", side_effect=curate) as mocked:
+        rc = main([
+            "--session", sd, "wait-all", "round-done", "--timeout", "0",
+            "--max-reviewer-failures", str(allowed),
+        ])
+    assert rc == expected
+    assert mocked.call_count == int(not unfinished and failures <= allowed and failures < count)
+    output = capsys.readouterr()
+    markers = [line for line in output.out.splitlines() if line.startswith("::")]
+    completed = count - failures - int(unfinished)
+    title = f"{completed}/{count} reviewers"
+    if failures:
+        title += f" ({failures} failed)"
+    expected_markers = [f"::group::{title}"]
+    if mocked.call_count:
+        expected_markers += ["::endgroup::", "::group::Curator"]
+        if not curator_fails:
+            expected_markers += ["::endgroup::"]
+    assert markers == expected_markers
+    if failures:
+        assert "reviewer0" in output.err
+    if failures:
+        assert not (Path(sd) / "signals/reviewer0.round-done").exists()
+
+
+def test_wait_all_reports_live_progress_without_duplicate_updates(tmp_path, monkeypatch, capsys):
+    from peanut_review import polling, runtime
+
+    sd = str(tmp_path / "session")
+    with patch("peanut_review.session._run_git", side_effect=_mock_git):
+        sess.create_session(
+            workspace=_make_cursor_workspace(),
+            agents=[{"name": f"reviewer{i}", "model": "test"} for i in range(4)],
+            session_dir=sd,
+        )
+    ticks = iter([None, 0, 1, 2, 3])
+
+    def advance(_seconds):
+        reviewer = next(ticks)
+        if reviewer is None:
+            return
+        if reviewer == 3:
+            runtime.update_agent_meta(sd, f"reviewer{reviewer}", {"exit_code": 1})
+        else:
+            polling.write_signal(sd, f"reviewer{reviewer}", "round-done")
+
+    monkeypatch.setattr(polling.time, "sleep", advance)
+    rc = main([
+        "--session", sd, "wait-all", "round-done", "--timeout", "60",
+        "--max-reviewer-failures", "1", "--no-curate",
+    ])
+    assert rc == 0
+    markers = [line for line in capsys.readouterr().out.splitlines() if line.startswith("::")]
+    expected = []
+    for title in ["0/4 reviewers", "1/4 reviewers", "2/4 reviewers", "3/4 reviewers",
+                  "3/4 reviewers (1 failed)"]:
+        expected.extend([f"::group::{title}", "::endgroup::"])
+    assert markers == expected
 
 
 def test_kill_agents_cli_prints_results():
@@ -259,6 +552,7 @@ def test_start_validates_cursor_cli_before_resolving_pr(tmp_path: Path):
         "repoRelative": "repo",
         "agents": [
             {"name": "vera", "model": "opus", "persona": "vera.md"},
+            {"name": "Curator", "model": "gpt-5.5-high", "role": "curator"},
         ],
     }))
 
@@ -268,7 +562,8 @@ def test_start_validates_cursor_cli_before_resolving_pr(tmp_path: Path):
 
     assert rc == 1
     assert "Cursor CLI config validation failed" in err.getvalue()
-    assert ".cursor/cli.json" in err.getvalue()
+    assert str(tmp_path / ".cursor" / "cli.json") in err.getvalue()
+    assert str(workspace / ".cursor" / "cli.json") not in err.getvalue()
 
 
 @patch("peanut_review.session._run_git", side_effect=_mock_git)
@@ -283,7 +578,7 @@ def test_add_comment_and_list(mock_git):
     # Add comment
     rc = main(["--session", sd, "add-comment",
                "--file", "src/foo.cpp", "--line", "42",
-               "--body", "Null check needed", "--severity", "critical",
+               "--body", "Null check needed",
                "--author", "vera"])
     assert rc == 0
 
@@ -458,7 +753,7 @@ def test_verdict_flow(mock_git):
 
     main(["--session", sd, "add-comment",
           "--file", "a.py", "--line", "1", "--body", "Critical bug",
-          "--severity", "critical", "--author", "vera"])
+          "--author", "vera"])
 
     rc = main(["--session", sd, "verdict", "--approve", "--body", "LGTM"])
     assert rc == 0
@@ -491,6 +786,7 @@ def test_status(mock_git):
         rc = main(["--session", sd, "status"])
     assert rc == 0
     text = out.getvalue()
+    assert "State:" not in text
     assert "vera" in text
     assert "process=pending" in text
     assert "review=pending" in text
@@ -607,29 +903,6 @@ def test_status_does_not_note_missing_pid_with_final_meta(mock_git):
     assert "recorded agent process PID(s)" not in err.getvalue()
 
 
-@patch("peanut_review.session._run_git", side_effect=_mock_git)
-def test_ask_and_reply(mock_git):
-    sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
-    main(["--session", sd, "init", "--workspace", "/tmp/repo"])
-
-    # Write a question manually (simulating agent)
-    from peanut_review.polling import write_question
-    write_question(sd, "vera", "Where is the build dir?")
-
-    # Check inbox
-    rc = main(["--session", sd, "inbox"])
-    assert rc == 0
-
-    # Reply
-    rc = main(["--session", sd, "reply", "--agent", "vera", "--id", "q_001",
-               "It's in ../build-release/"])
-    assert rc == 0
-
-    # Inbox should be empty now
-    from peanut_review.polling import list_unanswered
-    assert len(list_unanswered(sd)) == 0
-
-
 # ── Multi-pass wake-up + cursor tests ─────────────────────────────────
 
 
@@ -644,8 +917,6 @@ def test_signal_all_next_round_writes_wake_signals_and_clears_stale():
         {"name": "vera", "model": "opus", "persona": "vera.md"},
         {"name": "felix", "model": "sonnet", "persona": "felix.md"},
     ])
-    sess.transition_state(sd, models.SessionState.ROUND.value)
-
     # Simulate the first pass finishing and orchestrator already having
     # signaled next-round once (so leftover files exist).
     polling.write_signal(sd, "vera", "round-done")
@@ -662,37 +933,32 @@ def test_signal_all_next_round_writes_wake_signals_and_clears_stale():
     assert (sigs / "felix.next-round").exists()
 
 
-def test_signal_all_next_round_from_init_lifts_to_round_state():
-    """First `signal-all next-round` from INIT moves the session into
-    ROUND so subsequent state-aware logic kicks in."""
+def test_signal_all_next_round_does_not_add_lifecycle_state():
     sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
     _init_session(sd, agents=[{"name": "vera", "model": "opus", "persona": "vera.md"}])
-    assert sess.load_session(sd).state == "init"
 
     rc = main(["--session", sd, "signal-all", "next-round"])
     assert rc == 0
-    assert sess.load_session(sd).state == "round"
+    assert "state" not in json.loads((Path(sd) / "session.json").read_text())
 
 
-def test_signal_all_next_round_after_complete_refused():
-    """Once a session is COMPLETE/ABORTED, signaling next-round shouldn't
-    silently resurrect it."""
+def test_signal_all_next_round_remains_available_after_verdict():
     sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
     _init_session(sd, agents=[{"name": "vera", "model": "opus", "persona": "vera.md"}])
-    sess.transition_state(sd, models.SessionState.COMPLETE.value)
+    assert main(["--session", sd, "verdict", "--comment"]) == 0
 
     rc = main(["--session", sd, "signal-all", "next-round"])
-    assert rc != 0
-    assert sess.load_session(sd).state == "complete"
+    assert rc == 0
+    assert (Path(sd) / "signals" / "vera.next-round").exists()
 
 
-def test_signal_all_other_event_does_not_change_state():
+def test_signal_all_other_event_writes_signal():
     sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
     _init_session(sd, agents=[{"name": "vera", "model": "opus", "persona": "vera.md"}])
 
     rc = main(["--session", sd, "signal-all", "some-event"])
     assert rc == 0
-    assert sess.load_session(sd).state == "init"
+    assert (Path(sd) / "signals" / "vera.some-event").exists()
 
 
 def test_comments_since_filter_returns_only_newer():
@@ -789,10 +1055,41 @@ def test_add_comment_echoes_source_line():
                    "--body", "test", "--author", "vera"])
     assert rc == 0
     assert "foo.py:2: print('hello')" in out.getvalue()
+    assert len(store.read_all_comments(sd)) == 1
 
-    # Verify comment WAS stored
-    from peanut_review.store import read_all_comments
-    assert len(read_all_comments(sd)) == 1
+
+def test_github_comment_validation_uses_pinned_head(tmp_path):
+    repo = _make_git_repo()
+    (repo / "foo.py").write_text("\nline2\nline3\n")
+    _git(repo, "commit", "-q", "-am", "review snapshot")
+    review_head = _git(repo, "rev-parse", "HEAD").strip()
+    base = _git(repo, "rev-parse", "HEAD~").strip()
+    sd = str(tmp_path / "session")
+    sess.create_session(
+        workspace=str(repo),
+        base_ref=base,
+        topic_ref=review_head,
+        session_dir=sd,
+        github=models.GitHubPR(
+            repo="acme/foo", number=42,
+            head_sha=review_head, base_sha=base,
+        ),
+    )
+
+    # Move the checkout to content where line 3 does not exist.
+    (repo / "foo.py").write_text("different\n")
+    _git(repo, "commit", "-q", "-am", "different checkout")
+
+    rc = main([
+        "--session", sd, "add-comment",
+        "--file", "foo.py", "--line", "3",
+        "--body", "pinned line", "--author", "vera",
+    ])
+
+    assert rc == 0
+    [comment] = store.read_all_comments(sd)
+    assert comment.head_sha == review_head
+    assert comment.line == 3
 
 
 def test_add_comment_rejects_line_zero():
@@ -870,7 +1167,7 @@ def test_add_global_comment_via_subcommand_persists_with_empty_file():
     with redirect_stdout(out):
         rc = main(["--session", sd, "add-global-comment",
                    "--body", "Tests are missing for the new auth path",
-                   "--severity", "warning", "--author", "vera"])
+                   "--author", "vera"])
     assert rc == 0
     assert "(global)" in out.getvalue()
 
@@ -879,7 +1176,6 @@ def test_add_global_comment_via_subcommand_persists_with_empty_file():
     assert len(comments) == 1
     assert comments[0].file == ""
     assert comments[0].line == 0
-    assert comments[0].severity == "warning"
     assert comments[0].body.startswith("Tests are missing")
 
 
@@ -931,7 +1227,7 @@ def test_comments_listing_shows_global_marker():
     _init_session(sd, workspace=ws)
 
     main(["--session", sd, "add-global-comment",
-          "--body", "scope concern", "--severity", "warning", "--author", "vera"])
+          "--body", "scope concern", "--author", "vera"])
     main(["--session", sd, "add-comment",
           "--file", "foo.py", "--line", "1",
           "--body", "anchored", "--author", "felix"])
@@ -969,6 +1265,25 @@ def test_add_comment_reply_to_inherits_parent_location():
     assert reply.reply_to == parent_id
     assert reply.file == "foo.py"
     assert reply.line == 2
+
+
+def test_add_comment_reply_to_global_comment_errors():
+    ws = _make_workspace({"foo.py": "alpha\n"})
+    sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
+    _init_session(sd, workspace=ws)
+
+    main(["--session", sd, "add-global-comment", "--body", "scope concern",
+          "--author", "vera"])
+    from peanut_review.store import read_all_comments
+    parent_id = read_all_comments(sd)[0].id
+
+    err = io.StringIO()
+    with redirect_stderr(err):
+        rc = main(["--session", sd, "add-comment", "--reply-to", parent_id,
+                   "--body", "agreed", "--author", "felix"])
+    assert rc == 1
+    assert "replies to global comments are not supported" in err.getvalue()
+    assert len(read_all_comments(sd)) == 1
 
 
 def test_add_comment_reply_to_unknown_id_errors():
@@ -1184,13 +1499,13 @@ def test_edit_command_replaces_body_and_keeps_history():
     _init_session(sd, workspace=ws)
     main(["--session", sd, "add-comment",
           "--file", "foo.py", "--line", "1",
-          "--body", "first take", "--severity", "nit",
+          "--body", "first take",
           "--author", "felix"])
     from peanut_review.store import read_all_comments
     cid = read_all_comments(sd)[0].id
 
     rc = main(["--session", sd, "edit", cid,
-               "--body", "second take", "--severity", "warning",
+               "--body", "second take",
                "--author", "jakub"])
     assert rc == 0
 
@@ -1200,15 +1515,13 @@ def test_edit_command_replaces_body_and_keeps_history():
     listed = json.loads(out.getvalue())
     assert len(listed) == 1
     assert listed[0]["body"] == "second take"
-    assert listed[0]["severity"] == "warning"
     assert listed[0]["edited_by"] == "jakub"
     assert listed[0]["edited_at"]
     assert len(listed[0]["versions"]) == 1
     assert listed[0]["versions"][0]["body"] == "first take"
-    assert listed[0]["versions"][0]["severity"] == "nit"
 
 
-def test_edit_command_requires_body_or_severity():
+def test_edit_command_requires_body_or_category():
     sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
     _init_session(sd)
     err = io.StringIO()
@@ -1226,6 +1539,45 @@ def test_edit_command_unknown_comment_errors():
         rc = main(["--session", sd, "edit", "c_missing", "--body", "x"])
     assert rc == 1
     assert "not found" in err.getvalue()
+
+
+def test_migrate_repairs_stale_topic_ref_without_restaling_comments():
+    repo = _make_git_repo()
+    base_sha = _git(repo, "rev-parse", "HEAD").strip()
+    (repo / "foo.py").write_text("x = 2\n")
+    _git(repo, "commit", "-q", "-am", "topic")
+    old_head = _git(repo, "rev-parse", "HEAD").strip()
+    session_dir = Path(tempfile.mkdtemp(prefix="pr-test-")) / "session"
+    sess.create_session(
+        workspace=str(repo),
+        base_ref=base_sha,
+        topic_ref=old_head,
+        session_dir=str(session_dir),
+    )
+
+    (repo / "foo.py").write_text("x = 3\n")
+    _git(repo, "commit", "-q", "-am", "new topic")
+    new_head = _git(repo, "rev-parse", "HEAD").strip()
+
+    s = sess.load_session(session_dir)
+    s.current_head = new_head
+    s.topic_ref = old_head
+    s.diff_commands = [f"git diff {base_sha}...{old_head}"]
+    sess.save_session(session_dir, s)
+    c = models.Comment(author="vera", file="foo.py", line=1, body="x")
+    store.append_comment(session_dir, c)
+
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = main(["--session", str(session_dir), "migrate", "--new-head", new_head])
+
+    assert rc == 0
+    assert "Repaired diff target" in out.getvalue()
+    repaired = sess.load_session(session_dir)
+    assert repaired.current_head == new_head
+    assert repaired.topic_ref == new_head
+    assert repaired.diff_commands == [f"git diff {base_sha}...{new_head}"]
+    assert store.read_all_comments(session_dir)[0].stale is False
 
 
 def test_session_with_github_field_round_trips():

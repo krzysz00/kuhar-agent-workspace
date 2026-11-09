@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 from .models import (
@@ -16,10 +17,40 @@ from .models import (
 
 log = logging.getLogger(__name__)
 
-# O_APPEND writes are not strictly atomic on regular files (unlike pipes),
-# but since each agent writes to its own .jsonl file, concurrent interleaving
-# is not a concern. We warn on large lines as a safety check.
+# Gateway-backed reviewers can issue concurrent requests for the same author.
+# Use a stable sibling lock rather than locking the JSONL inode: atomic rewrites
+# replace that inode, so an inode lock cannot serialize appends with mutations.
 _PIPE_BUF = 4096
+
+
+def _lock_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.lock")
+
+
+@contextmanager
+def _store_lock(path: Path, *, exclusive: bool):
+    import fcntl
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(_lock_path(path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+def _locked_append(path: Path, line: str) -> None:
+    with _store_lock(path, exclusive=True):
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, line.encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def _comments_dir(session_dir: str | Path) -> Path:
@@ -38,7 +69,9 @@ def _agent_note_file(session_dir: str | Path, agent: str) -> Path:
     return _notes_dir(session_dir) / f"{agent}.jsonl"
 
 
-def _validate_comment_category(comment: Comment) -> None:
+def _validate_comment(comment: Comment) -> None:
+    if comment.reply_to and comment.file == "" and comment.line == 0:
+        raise ValueError("replies to global comments are not supported")
     comment.category = normalize_comment_category(comment.category)
     if category_is_review_decision(comment.category) and (
         comment.file != "" or comment.line != 0 or comment.reply_to
@@ -51,18 +84,13 @@ def _validate_comment_category(comment: Comment) -> None:
 
 def append_comment(session_dir: str | Path, comment: Comment) -> Comment:
     """Append a comment to the agent's JSONL file. Returns the comment."""
-    _validate_comment_category(comment)
+    _validate_comment(comment)
     path = _agent_file(session_dir, comment.author)
     path.parent.mkdir(parents=True, exist_ok=True)
     line = comment.to_json() + "\n"
     if len(line.encode()) > _PIPE_BUF:
         log.warning("Comment %s exceeds PIPE_BUF — write may not be atomic", comment.id)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    try:
-        os.write(fd, line.encode())
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    _locked_append(path, line)
     return comment
 
 
@@ -85,23 +113,18 @@ def read_all_comments(session_dir: str | Path) -> list[Comment]:
 
 
 def append_note(session_dir: str | Path, note: Note) -> Note:
-    """Append a free-form note to the author's JSONL file."""
+    """Append a non-review report to the author's JSONL file."""
     path = _agent_note_file(session_dir, note.author)
     path.parent.mkdir(parents=True, exist_ok=True)
     line = note.to_json() + "\n"
     if len(line.encode()) > _PIPE_BUF:
         log.warning("Note %s exceeds PIPE_BUF — write may not be atomic", note.id)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    try:
-        os.write(fd, line.encode())
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    _locked_append(path, line)
     return note
 
 
 def read_agent_notes(session_dir: str | Path, agent: str) -> list[Note]:
-    """Read all free-form notes from one agent's JSONL file."""
+    """Read all non-review reports from one agent's JSONL file."""
     path = _agent_note_file(session_dir, agent)
     if not path.exists():
         return []
@@ -144,7 +167,6 @@ def filter_comments(
     *,
     agent: str | None = None,
     file: str | None = None,
-    severity: str | None = None,
     category: str | None = None,
     since: str | None = None,
     unresolved: bool = False,
@@ -169,8 +191,6 @@ def filter_comments(
         result = [c for c in result if c.author == agent]
     if file:
         result = [c for c in result if c.file == file]
-    if severity:
-        result = [c for c in result if c.severity == severity]
     if category:
         category = normalize_comment_category(category)
         result = [c for c in result if c.category == category]
@@ -200,12 +220,13 @@ def _mutate_comment(
     """
     cdir = _comments_dir(session_dir)
     for f in cdir.glob("*.jsonl"):
-        comments = _read_jsonl(f)
-        for c in comments:
-            if c.id == comment_id:
-                mutator(c)
-                _write_jsonl(f, comments)
-                return True
+        with _store_lock(f, exclusive=True):
+            comments = _read_jsonl_unlocked(f)
+            for c in comments:
+                if c.id == comment_id:
+                    mutator(c)
+                    _write_jsonl_unlocked(f, comments)
+                    return True
     return False
 
 
@@ -288,37 +309,33 @@ def undelete_comment(session_dir: str | Path, comment_id: str) -> bool:
 def edit_comment(
     session_dir: str | Path, comment_id: str, *,
     body: str | None = None,
-    severity: str | None = None,
     category: str | None = None,
     edited_by: str,
 ) -> bool:
-    """Rewrite a comment's body/severity/category, snapshotting prior state.
+    """Rewrite a comment's body/category, snapshotting prior state.
 
     `versions[0]` is always the original creator's state (edited_at/by null).
-    Each subsequent call appends the *prior* state, then bumps body/severity/
-    category/edited_at/edited_by to the new values. Caller must pass at least
-    one of body, severity, or category. Returns True if the comment was found.
+    Each subsequent call appends the *prior* state, then updates the body,
+    category, and edit attribution. Caller must pass body or category.
+    Returns True if the comment was found.
     """
-    if body is None and severity is None and category is None:
-        raise ValueError("edit_comment requires body, severity, or category")
+    if body is None and category is None:
+        raise ValueError("edit_comment requires body or category")
     normalized_category = (
         normalize_comment_category(category) if category is not None else None
     )
     def _apply(c: Comment) -> None:
         c.versions.append({
             "body": c.body,
-            "severity": c.severity,
             "category": c.category,
             "edited_at": c.edited_at,
             "edited_by": c.edited_by,
         })
         if body is not None:
             c.body = body
-        if severity is not None:
-            c.severity = severity
         if normalized_category is not None:
             c.category = normalized_category
-        _validate_comment_category(c)
+        _validate_comment(c)
         c.edited_at = _now_iso()
         c.edited_by = edited_by
     return _mutate_comment(session_dir, comment_id, _apply)
@@ -357,23 +374,33 @@ def mark_stale(session_dir: str | Path) -> int:
     cdir = _comments_dir(session_dir)
     count = 0
     for f in cdir.glob("*.jsonl"):
-        comments = _read_jsonl(f)
-        changed = False
-        for c in comments:
-            if not c.resolved and not c.stale and not c.deleted:
-                c.stale = True
-                changed = True
-                count += 1
-        if changed:
-            _write_jsonl(f, comments)
+        with _store_lock(f, exclusive=True):
+            comments = _read_jsonl_unlocked(f)
+            changed = False
+            for c in comments:
+                if not c.resolved and not c.stale and not c.deleted:
+                    c.stale = True
+                    changed = True
+                    count += 1
+            if changed:
+                _write_jsonl_unlocked(f, comments)
     return count
 
 
 def _read_jsonl(path: Path) -> list[Comment]:
     """Read a JSONL file, skipping unparseable lines with a warning."""
+    with _store_lock(path, exclusive=False):
+        return _read_jsonl_unlocked(path)
+
+
+def _read_jsonl_unlocked(path: Path) -> list[Comment]:
     comments: list[Comment] = []
-    with open(path) as f:
-        for lineno, line in enumerate(f, 1):
+    try:
+        source = open(path)
+    except FileNotFoundError:
+        return comments
+    with source:
+        for lineno, line in enumerate(source, 1):
             line = line.strip()
             if not line:
                 continue
@@ -386,9 +413,18 @@ def _read_jsonl(path: Path) -> list[Comment]:
 
 def _read_note_jsonl(path: Path) -> list[Note]:
     """Read a note JSONL file, skipping unparseable lines with a warning."""
+    with _store_lock(path, exclusive=False):
+        return _read_note_jsonl_unlocked(path)
+
+
+def _read_note_jsonl_unlocked(path: Path) -> list[Note]:
     notes: list[Note] = []
-    with open(path) as f:
-        for lineno, line in enumerate(f, 1):
+    try:
+        source = open(path)
+    except FileNotFoundError:
+        return notes
+    with source:
+        for lineno, line in enumerate(source, 1):
             line = line.strip()
             if not line:
                 continue
@@ -399,8 +435,7 @@ def _read_note_jsonl(path: Path) -> list[Note]:
     return notes
 
 
-def _write_jsonl(path: Path, comments: list[Comment]) -> None:
-    """Rewrite a JSONL file atomically."""
+def _write_jsonl_unlocked(path: Path, comments: list[Comment]) -> None:
     tmp = path.with_suffix(".jsonl.tmp")
     with open(tmp, "w") as f:
         for c in comments:
@@ -430,7 +465,7 @@ def update_comment_external(
             c.timestamp = timestamp
         if category is not None:
             c.category = normalize_comment_category(category)
-            _validate_comment_category(c)
+            _validate_comment(c)
         if external_source is not None:
             c.external_source = external_source
         if external_id is not None:

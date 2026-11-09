@@ -1,0 +1,594 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import timedelta
+from subprocess import CalledProcessError
+
+import pytest
+from textual.containers import VerticalScroll
+from textual.widgets import Button, DataTable, Input, Static
+
+from review_queue.models import ProjectConfig, PullRequest, QueueConfig
+from review_queue.scheduler import Scheduler
+from review_queue.tui import ConfirmModal, PriorityModal, ReviewQueueApp, WatchModal
+from review_queue.util import isoformat, utc_now
+
+PYTEST_FAILURE = str(CalledProcessError(
+    1, ["python", "-m", "pytest", "tests", "--ignore=tests/test_corpus.py",
+        "-q", "-o", "cache_dir=/tmp/review/.pytest_cache"],
+))
+
+
+def seed(scheduler: Scheduler, project: ProjectConfig, *, count: int = 2) -> None:
+    records = tuple(
+        PullRequest(
+            project=project.name,
+            repo=project.repo,
+            number=number,
+            url=f"https://github.com/{project.repo}/pull/{number}",
+            title=f"Review {number}",
+            author=author,
+            head_sha=str(number) * 40,
+            head_ref=f"users/{author}/review-{number}",
+            updated_at=isoformat(utc_now() - timedelta(minutes=number)),
+        )
+        for number, author in enumerate(("alice", "bob") * count, start=1)
+        if number <= count
+    )
+    scheduler.db.apply_poll(
+        project,
+        records,
+        query_numbers=set(range(1, count + 1)),
+        bootstrap_hours=24,
+        push_quiet_seconds=0,
+    )
+
+
+async def test_manual_mode_controls_and_enqueue_marker(config, project):
+    scheduler = Scheduler(config)
+    seed(scheduler, project)
+    app = ReviewQueueApp(scheduler)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("m")
+        assert app.snapshot.mode == "manual"
+        assert scheduler.db.next_ready() is None
+        app.query_one("#queue-table", DataTable).focus()
+        await pilot.pause()
+        assert "press r to enqueue" in str(app.query_one("#detail", Static).render())
+        selected = app.selected_job
+        await pilot.press("r")
+        assert scheduler.db.next_ready().job_id == selected
+        assert app._selected_item().manual_enqueued
+        assert "▶" in str(app.query_one("#queue-table", DataTable).get_row(str(selected)))
+        await pilot.press("space")
+        assert app.snapshot.mode == "paused"
+        await pilot.press("space")
+        assert app.snapshot.mode == "manual"
+        await pilot.press("m")
+        assert app.snapshot.mode == "paused"
+        await pilot.press("m")
+        assert app.snapshot.mode == "active"
+
+
+async def test_poll_errors_and_recovery_are_visible_without_repeated_messages(config, project):
+    scheduler = Scheduler(config)
+    seed(scheduler, project)
+    error = "gh pr list: invalid character 'd' after object key"
+    scheduler.db.mark_poll_failure(project.name, error)
+    app = ReviewQueueApp(scheduler)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        activity = "\n".join(app.activity)
+        assert f"{project.name} GitHub refresh failed" in activity
+        assert error in activity and "g retries now" in activity
+        count = len(app.activity)
+        scheduler.db.mark_poll_failure(project.name, error)
+        app.refresh_view()
+        await pilot.pause()
+        assert len(app.activity) == count
+        seed(scheduler, project)
+        app.refresh_view()
+        await pilot.pause()
+        assert f"{project.name} GitHub refresh recovered" in "\n".join(app.activity)
+        assert len(app.activity) == count + 1
+
+
+@pytest.mark.parametrize("width", [80, 120])
+async def test_pr_indicator_next_to_review_count(config, project, width):
+    scheduler = Scheduler(config)
+    record = PullRequest(
+        project=project.name, repo=project.repo, number=1, title="Test", author="alice",
+        url=f"https://github.com/{project.repo}/pull/1", head_sha="a" * 40,
+        head_ref="topic", updated_at=isoformat(),
+    )
+    scheduler.db.set_manual_watch(record)
+    scheduler.db.create_wrapper(
+        project=project.name, repo=project.repo, number=1, path=project.wrapper_root / "pr-1",
+        token="owned", head_ref="topic",
+    )
+    app = ReviewQueueApp(scheduler)
+    async with app.run_test(size=(width, 30)) as pilot:
+        await pilot.pause()
+        for state, draft, expected in (
+            ("OPEN", True, "[grey62]D[/]"),
+            ("OPEN", False, ""),
+            ("CLOSED", True, "[bold red]C[/]"),
+            ("MERGED", False, "[bold #a371f7]M[/]"),
+        ):
+            scheduler.db.apply_poll(
+                project, [replace(record, state=state, is_draft=draft)], query_numbers=set(),
+                bootstrap_hours=24, push_quiet_seconds=0,
+            )
+            app.refresh_view()
+            for table_id in ("queue-table", "review-table"):
+                table = app.query_one(f"#{table_id}", DataTable)
+                headers = [str(col.label) for col in table.ordered_columns]
+                count_col = headers.index("R" if app.compact else "Reviewed")
+                assert table.get_row_at(0)[count_col + 1] == expected
+
+
+@pytest.mark.parametrize("width", [80, 120])
+async def test_my_approval_is_distinct_from_others_in_both_tables(config, project, width):
+    scheduler = Scheduler(config)
+    seed(scheduler, project)
+    with scheduler.db.connection:
+        scheduler.db.connection.execute(
+            "UPDATE pull_requests SET approval_viewer='Me', approved_by='[\"me\",\"alice\"]' "
+            "WHERE number=1"
+        )
+        scheduler.db.connection.execute(
+            "UPDATE pull_requests SET approval_viewer='Me', approved_by='[\"bob\"]' WHERE number=2"
+        )
+    scheduler.db.create_wrapper(
+        project=project.name,
+        repo=project.repo,
+        number=1,
+        path=project.wrapper_root / "pr-1",
+        token="owned",
+        head_ref="topic",
+    )
+    app = ReviewQueueApp(scheduler)
+    async with app.run_test(size=(width, 30)) as pilot:
+        await pilot.pause()
+        queue = app.query_one("#queue-table", DataTable)
+        reviews = app.query_one("#review-table", DataTable)
+        my_row = str(queue.get_row("1"))
+        other_row = str(queue.get_row("2"))
+        assert "You ✓" in my_row and "Others 1" in my_row
+        assert "You –" in other_row and "Others 1" in other_row
+        assert "You ✓" in str(reviews.get_row("1"))
+        assert "Others 1" in str(reviews.get_row("1"))
+        with scheduler.db.connection:
+            scheduler.db.connection.execute(
+                "UPDATE pull_requests SET approved_by='[]' WHERE number=1"
+            )
+        app.refresh_view()
+        await pilot.pause()
+        assert "You –" in str(reviews.get_row("1"))
+        assert "Others 0" in str(reviews.get_row("1"))
+
+
+async def test_headless_queue_rebalances_without_losing_selection(
+    config: QueueConfig, project: ProjectConfig
+) -> None:
+    scheduler = Scheduler(config)
+    seed(scheduler, project)
+    app = ReviewQueueApp(scheduler)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        table = app.query_one("#queue-table", DataTable)
+        assert table.row_count == 2
+        assert [widget.id for widget in app.query(VerticalScroll)] == ["activity-scroll"]
+        assert app.screen.max_scroll_y == 0
+        assert "State" not in {str(column.label) for column in table.columns.values()}
+        selected = app.selected_job
+        assert selected is not None
+        score = app._selected_item().score
+        await pilot.press("right")
+        await pilot.pause()
+        assert app.selected_job == selected
+        assert app._selected_item().score == score + 10
+        await pilot.press("left")
+        await pilot.pause()
+        assert app._selected_item().score == score
+        await pilot.press("space")
+        assert scheduler.db.paused()
+
+
+async def test_priority_modal_and_compact_layout(
+    config: QueueConfig, project: ProjectConfig
+) -> None:
+    scheduler = Scheduler(config)
+    seed(scheduler, project)
+    app = ReviewQueueApp(scheduler)
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.pause()
+        assert app.compact
+        assert app.screen.max_scroll_y == 0
+        assert app.query_one("#review-table", DataTable).styles.scrollbar_size_vertical == 0
+        await pilot.press("p")
+        assert isinstance(app.screen, PriorityModal)
+        app.screen.query_one("#priority-project", Input).value = "5"
+        app.screen.query_one("#priority-author", Input).value = "7"
+        app.screen.query_one("#priority-pr", Input).value = "11"
+        await pilot.click("#priority-save")
+        await pilot.pause()
+        assert app._selected_item().score == 23
+
+
+@pytest.mark.parametrize("table_id", ["queue-table", "review-table"])
+async def test_refresh_preserves_rows_selection_and_scrolled_view(config, project, table_id):
+    scheduler = Scheduler(config)
+    seed(scheduler, project, count=20)
+    for number in range(1, 21):
+        scheduler.db.create_wrapper(
+            project=project.name,
+            repo=project.repo,
+            number=number,
+            path=project.wrapper_root / str(number),
+            token=str(number),
+            head_ref="test",
+        )
+    app = ReviewQueueApp(scheduler)
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+        table = app.query_one(f"#{table_id}", DataTable)
+        table.focus()
+        table.move_cursor(row=4)
+        await pilot.pause()
+        selected = app.selected_job if table_id == "queue-table" else app.selected_wrapper
+        table.scroll_to(y=10, animate=False, immediate=True, force=True)
+        await pilot.pause()
+        position = table.scroll_y
+        assert position > 0
+        rows = tuple(table.ordered_rows)
+        for _ in range(3):
+            app.refresh_view()
+            await pilot.pause()
+            assert all(
+                before is after for before, after in zip(rows, table.ordered_rows, strict=True)
+            )
+            assert table.scroll_y == position
+            assert table.cursor_row == 4
+            assert (
+                app.selected_job if table_id == "queue-table" else app.selected_wrapper
+            ) == selected
+
+        # Changed cells must not rebuild the table or scroll back to its cursor.
+        with scheduler.db.connection:
+            scheduler.db.connection.execute("UPDATE pull_requests SET title = 'Updated title'")
+        app.refresh_view()
+        await pilot.pause()
+        assert all(before is after for before, after in zip(rows, table.ordered_rows, strict=True))
+        assert all(table.get_row(row.key)[-1] == "Updated title" for row in table.ordered_rows)
+        assert table.scroll_y == position
+        assert table.cursor_row == 4
+
+        # Removing a different row keeps selection by key, not row number.
+        removed = int(rows[0].key.value)
+        if table_id == "queue-table":
+            scheduler.db.mark_waiting_cancelled(removed)
+        else:
+            scheduler.db.remove_wrapper(removed)
+        app.refresh_view()
+        await pilot.pause()
+        assert (app.selected_job if table_id == "queue-table" else app.selected_wrapper) == selected
+        assert table.ordered_rows[table.cursor_row].key.value == str(selected)
+        assert table.scroll_y == position
+
+
+async def test_review_order_stays_fixed_when_status_or_recency_changes(config, project):
+    scheduler = Scheduler(config)
+    seed(scheduler, project)
+    for number in (1, 2):
+        scheduler.db.create_wrapper(
+            project=project.name,
+            repo=project.repo,
+            number=number,
+            path=project.wrapper_root / str(number),
+            token=str(number),
+            head_ref="test",
+        )
+    app = ReviewQueueApp(scheduler)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        table = app.query_one("#review-table", DataTable)
+        order = [row.key for row in table.ordered_rows]
+        first = int(order[0].value)
+        scheduler.db.update_wrapper(first, state="preparing", touch=True)
+        app.refresh_view()
+        await pilot.pause()
+        assert [row.key for row in table.ordered_rows] == order
+        assert "preparing" in str(table.get_row(str(first)))
+        scheduler.db.update_wrapper(first, state="idle", touch=True)
+        app.refresh_view()
+        await pilot.pause()
+        assert [row.key for row in table.ordered_rows] == order
+        assert "idle" in str(table.get_row(str(first)))
+        second = int(order[1].value)
+        job = next(item for item in scheduler.db.queue_items() if item.number == 2)
+        scheduler.db.attach_job(
+            job.job_id,
+            second,
+            log_path=config.state_dir / "running.log",
+            result_path=config.state_dir / "result.json",
+        )
+        scheduler.db.update_job(job.job_id, status="running")
+        app.refresh_view()
+        await pilot.pause()
+        assert [row.key for row in table.ordered_rows] == order
+        assert "running" in str(table.get_row(str(second)))
+
+
+@pytest.mark.parametrize("width", [80, 120])
+async def test_review_panel_fits_wrappers_and_adapts_to_terminal(config, project, width):
+    scheduler = Scheduler(replace(config, max_running=3, max_wrappers=5))
+    seed(scheduler, project, count=5)
+    app = ReviewQueueApp(scheduler)
+    async with app.run_test(size=(width, 30)) as pilot:
+        await pilot.pause()
+        pane = app.query_one("#reviews-pane")
+        table = app.query_one("#review-table", DataTable)
+        empty_height = pane.outer_size.height
+        ids = []
+        for number in range(1, 6):
+            ids.append(
+                scheduler.db.create_wrapper(
+                    project=project.name,
+                    repo=project.repo,
+                    number=number,
+                    path=project.wrapper_root / str(number),
+                    token=str(number),
+                    head_ref="test",
+                )
+            )
+        app.refresh_view()
+        await pilot.pause()
+        assert table.row_count == 5
+        assert pane.outer_size.height > empty_height
+        assert table.size.height >= 5
+        assert table.max_scroll_y == 0
+        assert app.query_one("#queue-pane").size.height >= 8
+
+        await pilot.resize_terminal(width, 18)
+        await pilot.pause()
+        assert table.size.height < 5
+        assert table.max_scroll_y > 0
+        assert app.screen.max_scroll_y == 0
+        assert app.query_one("#activity-pane").region.bottom < app.size.height
+
+        await pilot.resize_terminal(width, 40)
+        await pilot.pause()
+        assert table.size.height >= 5
+        assert table.max_scroll_y == 0
+        for wrapper_id in ids:
+            scheduler.db.remove_wrapper(wrapper_id)
+        app.refresh_view()
+        await pilot.pause()
+        assert pane.outer_size.height == empty_height
+
+
+async def test_theme_alias_and_cycle(config: QueueConfig, project: ProjectConfig) -> None:
+    scheduler = Scheduler(config)
+    seed(scheduler, project)
+    app = ReviewQueueApp(scheduler, theme_name="dark+")
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.pause()
+        assert app.theme == "dark-plus"
+        await pilot.press("t")
+        await pilot.pause()
+        assert app.theme == "monokai"
+
+
+@pytest.mark.parametrize("error", ["undefined symbol: missing", PYTEST_FAILURE])
+async def test_failure_history_survives_recycled_workspace_and_restart(config, project, error):
+    scheduler = Scheduler(config)
+    seed(scheduler, project)
+    item = scheduler.db.queue_items()[0]
+    scheduler.db.update_job(item.job_id, status="failed", error=error)
+    app = ReviewQueueApp(scheduler)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        assert app.query_one("#review-table", DataTable).row_count == 0
+        assert error in str(app.query_one("#activity-feed", Static).render())
+        count = len(app.activity)
+        app.refresh_view()
+        assert len(app.activity) == count
+
+
+async def test_ignore_removes_pr_and_future_heads(
+    config: QueueConfig, project: ProjectConfig
+) -> None:
+    scheduler = Scheduler(config)
+    seed(scheduler, project)
+    app = ReviewQueueApp(scheduler)
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.pause()
+        item = app._selected_item()
+        assert item is not None
+        app._ignore_confirmed(item.repo, item.number, True)
+        await pilot.pause()
+        assert all(queued.number != item.number for queued in scheduler.snapshot().queue)
+        assert "permanently ignored" in "\n".join(app.activity)
+
+
+async def test_include_dialog_is_keyboard_only(config: QueueConfig, project: ProjectConfig) -> None:
+    scheduler = Scheduler(config)
+    app = ReviewQueueApp(scheduler)
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.press("n")
+        await pilot.pause()
+        assert isinstance(app.screen, WatchModal)
+        assert not list(app.screen.query(Button))
+        assert app.screen.query_one("#watch-spec", Input).has_focus
+        await pilot.press("escape")
+
+
+async def test_quit_confirmation_is_keyboard_only(
+    config: QueueConfig, project: ProjectConfig
+) -> None:
+    scheduler = Scheduler(config)
+    seed(scheduler, project)
+    scheduler.db.update_job(scheduler.snapshot().queue[0].job_id, status="running")
+    app = ReviewQueueApp(scheduler)
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.press("q")
+        await pilot.pause()
+        assert isinstance(app.screen, ConfirmModal)
+        assert not list(app.screen.query(Button))
+        await pilot.press("escape")
+
+
+async def test_history_divider_drags_and_releases_mouse(config: QueueConfig) -> None:
+    app = ReviewQueueApp(Scheduler(config))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        divider = app.query_one("#history-divider")
+        history = app.query_one("#activity-pane")
+        queue = app.query_one("#queue-pane")
+        original_height = history.size.height
+        start_y = divider.region.y
+        await pilot.mouse_down("#history-divider", offset=(4, 0))
+        await pilot.hover(offset=(4, start_y - 8))
+        await pilot.pause()
+        assert history.size.height == original_height + 8
+        assert queue.size.height >= 8
+        assert app.mouse_captured is divider
+        await pilot.mouse_up(offset=(4, start_y - 8))
+        await pilot.pause()
+        assert app.mouse_captured is None
+        await pilot.hover(offset=(4, start_y - 12))
+        assert history.size.height == original_height + 8
+        assert app.screen.max_scroll_y == 0
+
+
+async def test_history_resize_limits_keyboard_and_terminal_resize(config: QueueConfig) -> None:
+    app = ReviewQueueApp(Scheduler(config))
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.pause()
+        history = app.query_one("#activity-pane")
+        original_height = history.size.height
+        await pilot.press("alt+up", "alt+up")
+        await pilot.pause()
+        assert history.size.height == original_height + 2
+        await pilot.press("alt+down")
+        await pilot.pause()
+        assert history.size.height == original_height + 1
+        await pilot.mouse_down("#history-divider", offset=(4, 0))
+        await pilot.hover(offset=(4, 0))
+        await pilot.pause()
+        assert app.query_one("#queue-pane").outer_size.height == 8
+        await pilot.mouse_up(offset=(4, 0))
+        await pilot.resize_terminal(80, 18)
+        await pilot.pause()
+        assert history.region.bottom < app.size.height
+        assert app.screen.max_scroll_y == 0
+        await pilot.press("slash")
+        await pilot.pause()
+        assert history.region.bottom < app.size.height
+        assert history.size.height >= 2
+        assert app.screen.max_scroll_y == 0
+        await pilot.press("escape")
+        await pilot.resize_terminal(80, 30)
+        await pilot.pause()
+        await pilot.mouse_down("#history-divider", offset=(4, 0))
+        await pilot.hover(offset=(4, 29))
+        await pilot.mouse_up(offset=(4, 29))
+        await pilot.pause()
+        assert history.size.height == 2
+
+
+async def test_history_scrolls_older_entries_and_survives_refresh(config: QueueConfig) -> None:
+    from textual import events
+    from textual.widgets import Static
+
+    app = ReviewQueueApp(Scheduler(config))
+    for number in range(50):
+        app._record_activity(f"history entry {number}")
+    async with app.run_test(size=(100, 35)) as pilot:
+        await pilot.pause()
+        feed = app.query_one("#activity-feed", Static)
+        history = app.query_one("#activity-scroll", VerticalScroll)
+        assert history.max_scroll_y > 0
+        assert "history entry 0" in str(feed.content)
+        await pilot._post_mouse_events(
+            [events.MouseScrollDown], widget="#activity-scroll", offset=(3, 1)
+        )
+        await pilot.pause(0.3)
+        assert history.scroll_y > 0
+        position = history.scroll_y
+        app.refresh_view()
+        await pilot.pause()
+        assert history.scroll_y == position
+
+
+@pytest.mark.parametrize("error", ["Build failed: missing symbol", PYTEST_FAILURE])
+async def test_failure_reason_visible_and_full_log_opens(config, project, error):
+    from review_queue.tui import LogModal
+
+    scheduler = Scheduler(config)
+    seed(scheduler, project)
+    item = scheduler.snapshot().queue[0]
+    wrapper = await scheduler._ensure_wrapper(item)
+    log = config.state_dir / "failure.log"
+    log.write_text("test.cpp:12: error: missing symbol\n== Final checkout ==\nready\n")
+    scheduler.db.attach_job(
+        item.job_id, wrapper["id"], log_path=log, result_path=config.state_dir / "failure.json"
+    )
+    scheduler.db.update_job(item.job_id, status="failed", error=error)
+    app = ReviewQueueApp(scheduler)
+    async with app.run_test(size=(120, 40)) as pilot:
+        app.query_one("#review-table", DataTable).focus()
+        await pilot.pause()
+        assert error in str(app.query_one("#detail", Static).render())
+        await pilot.press("l")
+        assert isinstance(app.screen, LogModal)
+        assert app.screen.reason == error
+        assert "test.cpp:12: error" in app.screen.log_text
+        await pilot.press("escape")
+        scheduler.db.update_job(item.job_id, status="ineligible", error="PR is merged")
+        app.refresh_view()
+        assert "skipped" in str(
+            app.query_one("#review-table", DataTable).get_row(str(wrapper["id"]))
+        )
+        assert "press r to retry" not in str(
+            app.query_one("#review-table", DataTable).get_row(str(wrapper["id"]))
+        )
+
+
+async def test_live_phase_elapsed_time_and_short_phase_history(config, project):
+    from review_queue.phases import PhaseChange
+
+    scheduler = Scheduler(config)
+    seed(scheduler, project)
+    item = scheduler.snapshot().queue[0]
+    wrapper = await scheduler._ensure_wrapper(item)
+    scheduler.db.attach_job(
+        item.job_id,
+        wrapper["id"],
+        log_path=config.state_dir / "run.log",
+        result_path=config.state_dir / "run.json",
+    )
+    scheduler.db.update_job(item.job_id, status="running")
+    started = isoformat(utc_now() - timedelta(minutes=2))
+    app = ReviewQueueApp(scheduler)
+    async with app.run_test(size=(160, 40)) as pilot:
+        for name in ["Build", "Build › Configure", "Build › Compile"]:
+            scheduler.db.update_phase(item.job_id, PhaseChange(name, started, True))
+        app.refresh_view()
+        app.query_one("#review-table", DataTable).focus()
+        await pilot.pause()
+        detail = str(app.query_one("#detail", Static).render())
+        assert "running" in detail
+        assert "Build › Compile" in detail
+        assert "2m in phase" in detail
+        history = "\n".join(app.activity)
+        assert "Build › Configure" in history  # Entered and left between UI refreshes.
+        assert "Build › Compile" in history
+        app.refresh_view()
+        assert "\n".join(app.activity) == history
+        scheduler.db.update_job(item.job_id, status="cancelling")
+        app.refresh_view()
+        row = str(app.query_one("#review-table", DataTable).get_row(str(wrapper["id"])))
+        assert "cancelling" in row
+        assert "Compile" in row

@@ -11,7 +11,9 @@ from peanut_review import agent_control, runtime, session as sess
 
 
 def _mock_git(workspace, *args):
-    if args == ("rev-parse", "HEAD"):
+    if args == ("rev-parse", "--path-format=absolute", "--git-common-dir"):
+        return "/tmp/fakerepo/.git"
+    if args[:2] == ("rev-parse", "--verify"):
         return "abc123def456"
     if args[0] == "diff" and "--stat" in args:
         return "+1 -0 1 file"

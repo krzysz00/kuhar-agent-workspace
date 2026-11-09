@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import models, polling, runtime, sandbox, session as sess, store, validation
+from . import curator, models, polling, runtime, sandbox, session as sess, store, validation
 
 
 def _get_session_dir(args: argparse.Namespace) -> str:
@@ -112,6 +112,66 @@ def _session_id_for_pr(repo: str, number: int, change_title: str | None = None) 
     return f"{repo_slug}-{change_slug}"
 
 
+def _agent_configs(raw_agents: list[dict]) -> list[models.AgentConfig]:
+    return [models.AgentConfig.from_dict(a) for a in raw_agents]
+
+
+def _require_configured_curator(agents: list[models.AgentConfig]) -> models.AgentConfig:
+    return curator.ensure_curator_agent(agents)
+
+
+def _github_pr_from_info(
+    pr_info,
+    *,
+    base_sha: str | None = None,
+    head_sha: str | None = None,
+) -> models.GitHubPR:
+    return models.GitHubPR(
+        repo=pr_info.repo,
+        number=pr_info.number,
+        url=pr_info.url,
+        head_sha=head_sha or pr_info.head_sha,
+        base_sha=base_sha or pr_info.base_sha,
+        title=pr_info.title,
+        head_ref_name=pr_info.head_ref_name,
+        body=pr_info.body,
+    )
+
+
+def _sync_session_to_pr(
+    session_dir: str | Path,
+    pr_info,
+    *,
+    base_ref: str | None = None,
+    topic_ref: str | None = None,
+    workspace: str | None = None,
+    repo_relative: str | None = None,
+) -> tuple[models.Session, bool, bool, int]:
+    existing = sess.load_session(session_dir)
+    if existing.github is not None and (
+        existing.github.repo != pr_info.repo
+        or existing.github.number != pr_info.number
+    ):
+        raise ValueError(
+            f"session is linked to {existing.github.repo}#{existing.github.number}, "
+            f"not {pr_info.repo}#{pr_info.number}"
+        )
+    session, head_changed, changed = sess.sync_session_snapshot(
+        session_dir,
+        base_ref=base_ref or pr_info.base_sha,
+        topic_ref=topic_ref or pr_info.head_sha,
+        github=_github_pr_from_info(
+            pr_info,
+            base_sha=base_ref,
+            head_sha=topic_ref,
+        ),
+        workspace=workspace,
+        repo_relative=repo_relative,
+    )
+    stale_count = store.mark_stale(session_dir) if head_changed else 0
+    return session, head_changed, changed, stale_count
+
+
 # ── Subcommand handlers ────────────────────────────────────────────
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -122,6 +182,12 @@ def cmd_init(args: argparse.Namespace) -> int:
             agents = json.loads(args.agents)
         else:
             agents = json.loads(Path(args.agents).read_text())
+    ssh_targets = None
+    if args.ssh_targets:
+        if args.ssh_targets.startswith("{"):
+            ssh_targets = json.loads(args.ssh_targets)
+        else:
+            ssh_targets = json.loads(Path(args.ssh_targets).read_text())
 
     personas_dir = args.personas_dir or _default_personas_dir()
 
@@ -150,14 +216,10 @@ def cmd_init(args: argparse.Namespace) -> int:
                 pr_info.repo, pr_info.number,
                 pr_info.head_ref_name or pr_info.title,
             )
-        github = models.GitHubPR(
-            repo=pr_info.repo,
-            number=pr_info.number,
-            url=pr_info.url,
-            head_sha=pr_info.head_sha,
-            base_sha=pr_info.base_sha,
-            title=pr_info.title,
-            head_ref_name=pr_info.head_ref_name,
+        github = _github_pr_from_info(
+            pr_info,
+            base_sha=base_ref,
+            head_sha=topic_ref,
         )
     else:
         base_ref = args.base if args.base is not None else "main"
@@ -166,14 +228,17 @@ def cmd_init(args: argparse.Namespace) -> int:
     try:
         session, session_dir = sess.create_session(
             workspace=os.path.abspath(args.workspace),
+            repo_relative=getattr(args, "repo_relative", None),
             base_ref=base_ref,
             topic_ref=topic_ref,
             agents=agents,
+            ssh_targets=ssh_targets,
             personas_dir=personas_dir if personas_dir else None,
             timeout=args.timeout,
             session_dir=args.session,
             session_id=session_id,
             github=github,
+            include_curator=github is not None,
         )
     except (RuntimeError, ValueError) as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -391,10 +456,12 @@ def cmd_start(args: argparse.Namespace) -> int:
             args.config,
             personas_dir_override=args.personas_dir,
         )
+        agent_configs = _agent_configs(cfg["agents"])
+        configured_curator = _require_configured_curator(agent_configs)
         if not args.no_launch:
             validation.validate_launch_prerequisites(
                 workspace=cfg["workspace"],
-                agents=[models.AgentConfig.from_dict(a) for a in cfg["agents"]],
+                agents=agent_configs,
                 cli_json=getattr(args, "cli_json", None),
             )
     except ValueError as e:
@@ -403,7 +470,7 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     from . import gh
     try:
-        repo, number = gh.resolve_pr_spec(args.pr, workspace=cfg["workspace"])
+        repo, number = gh.resolve_pr_spec(args.pr, workspace=cfg["repoPath"])
         pr_info = gh.fetch_pr_info(repo, number)
     except (ValueError, gh.GhError) as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -433,16 +500,24 @@ def cmd_start(args: argparse.Namespace) -> int:
         print(f"Config:   {config_path}")
         print(f"Session:  {session_dir}")
         print(f"Workspace: {cfg['workspace']}")
+        print(f"Repo:      {cfg['repoPath']}")
         print(f"PR:       {pr_info.repo}#{pr_info.number}")
         print(f"Agents:   {len(agents)}")
         print()
         print("Init command:")
-        print(
+        init_command = (
             "  peanut-review --session "
             f"{shlex.quote(str(session_dir))} init --workspace "
-            f"{shlex.quote(cfg['workspace'])} --gh-pr {pr_info.repo}#{pr_info.number} "
+            f"{shlex.quote(cfg['workspace'])} --repo-relative "
+            f"{shlex.quote(cfg['repoRelative'])} "
+            f"--gh-pr {pr_info.repo}#{pr_info.number} "
             f"--timeout {timeout} --agents {shlex.quote(json.dumps(agents))}"
         )
+        if cfg.get("sshTargets"):
+            init_command += " --ssh-targets " + shlex.quote(
+                json.dumps(cfg["sshTargets"])
+            )
+        print(init_command)
         print("Fetch comments command:")
         print(f"  peanut-review --session {shlex.quote(str(session_dir))} gh-pull")
         if not args.no_launch:
@@ -461,29 +536,54 @@ def cmd_start(args: argparse.Namespace) -> int:
         return 1
 
     if session_json.exists():
-        session_obj = sess.load_session(session_dir)
+        if args.sync:
+            try:
+                session_obj, head_changed, changed, stale_count = _sync_session_to_pr(
+                    session_dir,
+                    pr_info,
+                    base_ref=args.base,
+                    topic_ref=args.topic,
+                    workspace=cfg["workspace"],
+                    repo_relative=cfg["repoRelative"],
+                )
+            except (RuntimeError, ValueError) as e:
+                print(f"Error: could not synchronize session: {e}", file=sys.stderr)
+                return 1
+            if changed:
+                action = "moved" if head_changed else "repaired"
+                print(
+                    f"Synchronized PR snapshot ({action}); "
+                    f"marked {stale_count} comments stale"
+                )
+        else:
+            session_obj = sess.load_session(session_dir)
+        if session_obj.github is not None:
+            try:
+                sess.ensure_curator(session_obj)
+            except ValueError:
+                session_obj.agents.append(configured_curator)
+            sess.save_session(session_dir, session_obj)
         print(session_dir)
     else:
-        github = models.GitHubPR(
-            repo=pr_info.repo,
-            number=pr_info.number,
-            url=pr_info.url,
-            head_sha=pr_info.head_sha,
-            base_sha=pr_info.base_sha,
-            title=pr_info.title,
-            head_ref_name=pr_info.head_ref_name,
+        github = _github_pr_from_info(
+            pr_info,
+            base_sha=args.base,
+            head_sha=args.topic,
         )
         try:
             session_obj, created_dir = sess.create_session(
                 workspace=cfg["workspace"],
+                repo_relative=cfg["repoRelative"],
                 base_ref=args.base if args.base is not None else pr_info.base_sha,
                 topic_ref=args.topic if args.topic is not None else pr_info.head_sha,
                 agents=agents,
+                ssh_targets=cfg.get("sshTargets"),
                 personas_dir=personas_dir if personas_dir else None,
                 timeout=timeout,
                 session_dir=str(session_dir),
                 session_id=session_id,
                 github=github,
+                include_curator=True,
             )
         except (RuntimeError, ValueError) as e:
             print(f"Error: {e}", file=sys.stderr)
@@ -525,6 +625,41 @@ def cmd_start(args: argparse.Namespace) -> int:
         else:
             pid_str = "dry-run"
         print(f"  {r['name']}: {pid_str}")
+    return 0
+
+
+def cmd_sync_pr(args: argparse.Namespace) -> int:
+    """Explicitly synchronize a session to the current GitHub PR snapshot."""
+    session_dir = _get_session_dir(args)
+    session = sess.load_session(session_dir)
+    if args.pr:
+        spec = args.pr
+    elif session.github is not None:
+        spec = f"{session.github.repo}#{session.github.number}"
+    else:
+        print("Error: PR argument required for an unlinked session", file=sys.stderr)
+        return 1
+
+    from . import gh
+    try:
+        repo, number = gh.resolve_pr_spec(spec, workspace=sess.repo_path(session))
+        pr_info = gh.fetch_pr_info(repo, number)
+        synced, head_changed, changed, stale_count = _sync_session_to_pr(
+            session_dir, pr_info,
+        )
+    except (RuntimeError, ValueError, gh.GhError) as e:
+        print(f"Error: could not synchronize session: {e}", file=sys.stderr)
+        return 1
+
+    if not changed:
+        print("PR snapshot unchanged")
+    elif head_changed:
+        print(
+            f"Synchronized to {synced.current_head[:12]}, "
+            f"marked {stale_count} comments stale"
+        )
+    else:
+        print(f"Repaired PR snapshot at {synced.current_head[:12]}")
     return 0
 
 
@@ -577,6 +712,10 @@ def cmd_add_comment(args: argparse.Namespace) -> int:
                   file=sys.stderr)
             return 1
         parent = next(c for c in all_comments if c.id == reply_to)
+        if parent.file == sess.GLOBAL_FILE:
+            print("Error: replies to global comments are not supported",
+                  file=sys.stderr)
+            return 1
         file = parent.file
         line = parent.line
         end_line = None
@@ -606,7 +745,12 @@ def cmd_add_comment(args: argparse.Namespace) -> int:
             file = args.file
             line = args.line
             end_line = args.end_line
-            file_lines, err = sess.validate_comment_location(s.workspace, file, line)
+            file_lines, err = sess.validate_comment_location(
+                sess.review_repo_path(s), file, line,
+                head_ref=s.current_head,
+                require_pinned=s.github is not None,
+                checkout=sess.repo_path(s),
+            )
             if err:
                 print(f"Error: {err}", file=sys.stderr)
                 return 1
@@ -617,7 +761,6 @@ def cmd_add_comment(args: argparse.Namespace) -> int:
         line=line,
         end_line=end_line,
         body=body,
-        severity=args.severity,
         category=category,
         head_sha=s.current_head,
         reply_to=reply_to,
@@ -668,7 +811,7 @@ def _read_note_body(args: argparse.Namespace) -> str | None:
 
 
 def cmd_note(args: argparse.Namespace) -> int:
-    """Record a free-form activity note outside the review comment stream."""
+    """Record a non-review agent report outside the comment stream."""
     session_dir = _get_session_dir(args)
     author = _get_author(args)
     body = _read_note_body(args)
@@ -682,7 +825,7 @@ def cmd_note(args: argparse.Namespace) -> int:
 
 
 def cmd_notes(args: argparse.Namespace) -> int:
-    """List/filter free-form notes."""
+    """List/filter non-review agent reports."""
     session_dir = _get_session_dir(args)
     notes = store.filter_notes(
         store.read_all_notes(session_dir),
@@ -695,7 +838,7 @@ def cmd_notes(args: argparse.Namespace) -> int:
         return 0
 
     if not notes:
-        print("No notes found.")
+        print("No reports found.")
         return 0
     hdr = f"{'ID':<14} {'Agent':<10} {'Timestamp':<32} {'Body'}"
     print(hdr)
@@ -714,7 +857,6 @@ def cmd_comments(args: argparse.Namespace) -> int:
         comments,
         agent=args.agent,
         file=args.file,
-        severity=args.severity,
         category=args.category,
         since=args.since,
         unresolved=args.unresolved,
@@ -728,7 +870,7 @@ def cmd_comments(args: argparse.Namespace) -> int:
         if not comments:
             print("No comments found.")
             return 0
-        hdr = f"{'ID':<14} {'Agent':<10} {'Sev':<10} {'Cat':<15} {'File':<30} {'Line':>5}    {'Body'}"
+        hdr = f"{'ID':<14} {'Agent':<10} {'Cat':<15} {'File':<30} {'Line':>5}    {'Body'}"
         print(hdr)
         print("-" * len(hdr))
         for c in comments:
@@ -745,7 +887,7 @@ def cmd_comments(args: argparse.Namespace) -> int:
             body = c.body[:60].replace("\n", " ")
             file_col = "[global]" if c.file == sess.GLOBAL_FILE else c.file
             line_col = "" if c.file == sess.GLOBAL_FILE else str(c.line)
-            print(f"{c.id:<14} {c.author:<10} {c.severity:<10} {c.category:<15} {file_col:<30} {line_col:>5} {flag}  {body}")
+            print(f"{c.id:<14} {c.author:<10} {c.category:<15} {file_col:<30} {line_col:>5} {flag}  {body}")
             if args.show_edits and c.versions:
                 for i, v in enumerate(c.versions, 1):
                     vbody = (v.get("body") or "")[:60].replace("\n", " ")
@@ -755,7 +897,7 @@ def cmd_comments(args: argparse.Namespace) -> int:
 
 
 def cmd_edit(args: argparse.Namespace) -> int:
-    """Edit an existing comment's body and/or severity, snapshotting prior
+    """Edit an existing comment's body and/or category, snapshotting prior
     state into Comment.versions. Rewrites the comment's JSONL row in place.
     """
     session_dir = _get_session_dir(args)
@@ -772,7 +914,6 @@ def cmd_edit(args: argparse.Namespace) -> int:
     else:
         body = None
 
-    severity: str | None = args.severity
     category: str | None = None
     if args.category is not None:
         try:
@@ -781,15 +922,15 @@ def cmd_edit(args: argparse.Namespace) -> int:
             print(f"Error: {e}", file=sys.stderr)
             return 1
 
-    if body is None and severity is None and category is None:
-        print("Error: at least one of --body, --body-file, --severity, --category required",
+    if body is None and category is None:
+        print("Error: at least one of --body, --body-file, --category required",
               file=sys.stderr)
         return 1
 
     try:
         edited = store.edit_comment(
             session_dir, args.comment_id,
-            body=body, severity=severity, category=category, edited_by=edited_by,
+            body=body, category=category, edited_by=edited_by,
         )
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -830,7 +971,10 @@ def cmd_gh_push(args: argparse.Namespace) -> int:
     s, ghpr = pair
 
     comments = store.read_all_comments(session_dir)
-    plan = _gh_push.plan_push(comments)
+    anchor_index = _gh_push.build_review_anchor_index(
+        sess.review_repo_path(s), s.base_ref, s.topic_ref,
+    )
+    plan = _gh_push.plan_push(comments, anchor_index=anchor_index)
 
     if plan.total == 0:
         suffixes = []
@@ -843,12 +987,29 @@ def cmd_gh_push(args: argparse.Namespace) -> int:
         return 0
 
     if args.dry_run:
+        if plan.anchor_validation_error:
+            print(
+                "[dry-run] anchor validation skipped: "
+                f"{plan.anchor_validation_error}"
+            )
         for c in plan.new_top:
-            kind = "global" if c.file == sess.GLOBAL_FILE else f"{c.file}:{c.line}"
-            print(f"[dry-run] {c.id} ({c.severity}, {c.category}) → {kind}")
+            promotion = plan.promoted_anchors.get(c.id)
+            if promotion is not None:
+                kind = f"global (from {promotion.ref})"
+            else:
+                kind = "global" if c.file == sess.GLOBAL_FILE else f"{c.file}:{c.line}"
+            print(f"[dry-run] {c.id} ({c.category}) → {kind}")
         for c in plan.new_replies:
-            parent_ext = plan.ext_map.get(c.reply_to)
-            tag = f"reply→gh#{parent_ext}" if parent_ext else "reply→<parent not pushed>"
+            if c.file == sess.GLOBAL_FILE:
+                tag = "reply→<unsupported global comment>"
+            elif c.reply_to in plan.promoted_anchors:
+                tag = "reply→<parent promoted to global>"
+            else:
+                parent_ext = plan.ext_map.get(c.reply_to)
+                tag = (
+                    f"reply→gh#{parent_ext}"
+                    if parent_ext else "reply→<parent not pushed>"
+                )
             print(f"[dry-run] {c.id} → {tag}")
         for c in plan.edits:
             print(f"[dry-run] {c.id} EDIT → gh#{c.external_id}")
@@ -1024,16 +1185,115 @@ def cmd_wait_all(args: argparse.Namespace) -> int:
     """Wait for all agents to signal an event."""
     session_dir = _get_session_dir(args)
     s = sess.load_session(session_dir)
-    agents = [a.name for a in s.agents]
-    timed_out = polling.wait_all_signals(
-        session_dir, agents, args.event,
-        timeout=args.timeout, poll_interval=args.poll,
-    )
+    agents = [a.name for a in sess.reviewer_agents(s)]
+    max_failures = args.max_reviewer_failures
+    if max_failures < 0 or (max_failures and args.event != runtime.ROUND_DONE_EVENT):
+        print("--max-reviewer-failures must be nonnegative and requires round-done", file=sys.stderr)
+        return 1
+    if not agents:
+        print("No reviewer agents configured", file=sys.stderr)
+        return 1
+    failed = []
+    if args.event == runtime.ROUND_DONE_EVENT:
+        progress_started = False
+
+        def report_progress(completed: int, total: int, failed_count: int) -> None:
+            nonlocal progress_started
+            if progress_started:
+                print("::endgroup::", flush=True)
+            title = f"{completed}/{total} reviewers"
+            if failed_count:
+                title += f" ({failed_count} failed)"
+            print(f"::group::{title}", flush=True)
+            progress_started = True
+
+        failed, timed_out = polling.wait_round_completion(
+            session_dir, agents, timeout=args.timeout, poll_interval=args.poll,
+            on_progress=report_progress,
+        )
+    else:
+        timed_out = polling.wait_all_signals(
+            session_dir, agents, args.event,
+            timeout=args.timeout, poll_interval=args.poll,
+        )
+    if failed:
+        print(f"Reviewers failed without round-done: {', '.join(failed)}", file=sys.stderr)
+    if len(failed) > max_failures or len(failed) == len(agents):
+        print(f"Reviewer failure limit exceeded ({len(failed)}/{len(agents)}, "
+              f"allowed {max_failures}); curator skipped", file=sys.stderr)
+        return 1
     if not timed_out:
-        print(f"All agents signaled {args.event}")
+        if failed:
+            print(f"{len(agents) - len(failed)}/{len(agents)} reviewers signaled {args.event}; "
+                  f"continuing with {len(failed)} failed reviewers")
+        else:
+            print(f"All reviewers signaled {args.event}")
+        if args.event == runtime.ROUND_DONE_EVENT:
+            print("::endgroup::", flush=True)
+        if (
+            args.event == runtime.ROUND_DONE_EVENT
+            and s.github is not None
+            and not args.no_curate
+        ):
+            return _run_auto_curator_after_wait(session_dir, args)
         return 0
     print(f"Timed out waiting for: {', '.join(timed_out)}", file=sys.stderr)
     return 1
+
+
+def _run_auto_curator_after_wait(session_dir: str, args: argparse.Namespace) -> int:
+    from . import launch
+
+    print("::group::Curator", flush=True)
+    s = sess.load_session(session_dir)
+    try:
+        curator_agent = sess.ensure_curator(s)
+    except ValueError as e:
+        print(f"Error: could not launch curator: {e}", file=sys.stderr)
+        return 1
+    if not (Path(session_dir) / "signals" / f"{curator_agent.name}.round-done").exists():
+        sess.save_session(session_dir, s)
+        try:
+            results = launch.launch_curator(session_dir)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"Error: could not launch curator: {e}", file=sys.stderr)
+            return 1
+        print("Launched curator:")
+        _print_launch_results(results)
+    else:
+        print(f"Curator already signaled {args.event}")
+
+    failed, timed_out = polling.wait_round_completion(
+        session_dir, [curator_agent.name],
+        timeout=args.timeout, poll_interval=args.poll,
+    )
+    if failed:
+        print(f"Curator failed without round-done: {', '.join(failed)}", file=sys.stderr)
+        return 1
+    if timed_out:
+        print(f"Timed out waiting for curator: {', '.join(timed_out)}", file=sys.stderr)
+        return 1
+    print(f"Curator signaled {args.event}")
+    print("::endgroup::", flush=True)
+    return 0
+
+
+def cmd_curate(args: argparse.Namespace) -> int:
+    """Launch the dedicated comment curator agent."""
+    session_dir = _get_session_dir(args)
+    from . import launch
+    try:
+        results = launch.launch_curator(
+            session_dir,
+            template_path=args.template,
+            dry_run=args.dry_run,
+            cli_json=getattr(args, "cli_json", None),
+        )
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    _print_launch_results(results)
+    return 0
 
 
 def _clear_signals_matching(session_dir: str, suffixes: list[str]) -> None:
@@ -1062,63 +1322,17 @@ def cmd_signal_all(args: argparse.Namespace) -> int:
 
     Special-case `next-round`: clears any stale `next-round` / `round-done`
     signal files so a fresh `wait next-round` in the new pass doesn't
-    auto-satisfy on a leftover file, and lifts the session out of INIT into
-    ROUND on first call. No-op for sessions that are already COMPLETE or
-    ABORTED.
+    auto-satisfy on a leftover file.
     """
     session_dir = _get_session_dir(args)
     s = sess.load_session(session_dir)
-    agents = [a.name for a in s.agents]
+    agents = [a.name for a in sess.reviewer_agents(s)]
 
     if args.event == "next-round":
-        if s.state in (models.SessionState.COMPLETE.value,
-                       models.SessionState.ABORTED.value):
-            print(f"Cannot signal next-round: session state is {s.state}",
-                  file=sys.stderr)
-            return 1
         _clear_signals_matching(session_dir, ["next-round", "round-done"])
-        if s.state == models.SessionState.INIT.value:
-            sess.transition_state(session_dir, models.SessionState.ROUND.value)
 
     polling.signal_all(session_dir, agents, args.event)
     print(f"Signaled {args.event} to {', '.join(agents)}")
-    return 0
-
-
-def cmd_ask(args: argparse.Namespace) -> int:
-    """Ask a question and block until answered."""
-    session_dir = _get_session_dir(args)
-    agent = _get_author(args)
-    q = polling.write_question(session_dir, agent, args.question)
-    print(f"Asked {q.id}: {q.question}", file=sys.stderr)
-    reply = polling.wait_reply(
-        session_dir, agent, q.id,
-        timeout=args.timeout,
-    )
-    if reply:
-        print(reply.answer)
-        return 0
-    print("Timeout waiting for reply", file=sys.stderr)
-    return 1
-
-
-def cmd_inbox(args: argparse.Namespace) -> int:
-    """Show unanswered questions."""
-    session_dir = _get_session_dir(args)
-    questions = polling.list_unanswered(session_dir, agent=args.agent)
-    if not questions:
-        print("No unanswered questions.")
-        return 0
-    for q in questions:
-        print(f"[{q.agent}] {q.id}: {q.question}")
-    return 0
-
-
-def cmd_reply(args: argparse.Namespace) -> int:
-    """Reply to an agent's question."""
-    session_dir = _get_session_dir(args)
-    polling.write_reply(session_dir, args.agent, args.id, args.answer)
-    print(f"Replied to {args.agent}/{args.id}")
     return 0
 
 
@@ -1137,12 +1351,11 @@ def cmd_verdict(args: argparse.Namespace) -> int:
 
     # Summary per agent
     agents_summary = []
-    for agent_cfg in s.agents:
+    for agent_cfg in sess.reviewer_agents(s):
         ac = [c for c in comments if c.author == agent_cfg.name]
         agents_summary.append({
             "agent": agent_cfg.name,
             "total": len(ac),
-            "critical": sum(1 for c in ac if c.severity == "critical"),
             "resolved": sum(1 for c in ac if c.resolved),
         })
 
@@ -1155,8 +1368,6 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     result_path = Path(session_dir) / "result.json"
     result_path.write_text(v.to_json() + "\n")
 
-    sess.transition_state(session_dir, models.SessionState.COMPLETE.value)
-
     print(f"Verdict: {decision}")
     return 0
 
@@ -1166,25 +1377,36 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     session_dir = _get_session_dir(args)
     s = sess.load_session(session_dir)
 
-    new_head = args.new_head
-    if not new_head:
-        result = subprocess.run(
-            ["git", "-C", s.workspace, "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            print(f"Error: git rev-parse failed: {result.stderr.strip()}", file=sys.stderr)
-            return 1
-        new_head = result.stdout.strip()
+    requested_head = args.new_head or "HEAD"
+    try:
+        new_head = sess.resolve_git_ref(sess.repo_path(s), requested_head)
+        head_changed = new_head != s.current_head
+        metadata_changed = sess.retarget_review_head(s, new_head)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
-    if new_head == s.current_head:
+    if not head_changed and not metadata_changed:
         print("HEAD unchanged, nothing to migrate")
         return 0
 
-    count = store.mark_stale(session_dir)
-    s.current_head = new_head
+    count = store.mark_stale(session_dir) if head_changed else 0
     sess.save_session(session_dir, s)
-    print(f"Migrated to {new_head[:12]}, marked {count} comments stale")
+    if head_changed:
+        print(f"Migrated to {new_head[:12]}, marked {count} comments stale")
+    else:
+        print(f"Repaired diff target for {new_head[:12]}")
+    return 0
+
+
+def cmd_retain_git(args: argparse.Namespace) -> int:
+    """Retain pinned Git objects and repair durable session storage."""
+    try:
+        session = sess.repair_review_git(_get_session_dir(args), args.repo)
+    except RuntimeError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    print(f"Git storage: {session.git_common_dir}")
     return 0
 
 
@@ -1195,12 +1417,34 @@ def cmd_status(args: argparse.Namespace) -> int:
     sess.refresh_agent_statuses(session_dir, s)
 
     print(f"Session:  {s.id}")
-    print(f"State:    {s.state}")
     print(f"Base:     {s.base_ref}")
     print(f"Head:     {s.current_head[:12]}")
     if s.original_head != s.current_head:
         print(f"Original: {s.original_head[:12]}")
     print(f"Workspace: {s.workspace}")
+    if s.repo_relative:
+        print(f"Repo:      {sess.repo_path(s)}")
+    if s.git_common_dir:
+        print(f"Git storage: {s.git_common_dir}")
+    workspace_mismatch, workspace_head = sess.workspace_head_mismatch(s)
+    if workspace_head:
+        print(f"Workspace HEAD: {workspace_head[:12]}")
+    if workspace_mismatch:
+        print("Warning: workspace differs from the pinned review snapshot")
+
+    consistency_warnings = []
+    if s.topic_ref != s.current_head:
+        consistency_warnings.append("topic_ref does not match current_head")
+    expected_command = f"git diff {s.base_ref}...{s.topic_ref}"
+    if s.diff_commands != [expected_command]:
+        consistency_warnings.append("diff_commands do not match the pinned refs")
+    if s.github is not None:
+        if s.github.head_sha != s.current_head:
+            consistency_warnings.append("GitHub head does not match current_head")
+        if s.github.base_sha != s.base_ref:
+            consistency_warnings.append("GitHub base does not match base_ref")
+    for warning in consistency_warnings:
+        print(f"Warning: {warning}")
     print()
 
     # Agents
@@ -1240,7 +1484,6 @@ def cmd_status(args: argparse.Namespace) -> int:
         print()
         parts = [
             f"{len(live)} total",
-            f"{sum(1 for c in live if c.severity == 'critical')} critical",
             f"{sum(1 for c in live if c.category == 'approve')} approvals",
             f"{sum(1 for c in live if c.category == 'request-changes')} blocking",
             f"{sum(1 for c in live if c.resolved)} resolved",
@@ -1253,7 +1496,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     notes = store.read_all_notes(session_dir)
     if notes:
         print()
-        print(f"Notes: {len(notes)}")
+        print(f"Reports: {len(notes)}")
 
     # Signals
     signals_dir = Path(session_dir) / "signals"
@@ -1262,14 +1505,6 @@ def cmd_status(args: argparse.Namespace) -> int:
         if sigs:
             print()
             print(f"Signals: {', '.join(sigs)}")
-
-    # Unanswered questions
-    questions = polling.list_unanswered(session_dir)
-    if questions:
-        print()
-        print(f"Unanswered questions: {len(questions)}")
-        for q in questions:
-            print(f"  [{q.agent}] {q.id}: {q.question[:60]}")
 
     return 0
 
@@ -1332,6 +1567,60 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gateway_serve(args: argparse.Namespace) -> int:
+    """Run the dedicated reviewer gateway in the foreground."""
+    from . import gateway
+    roots = args.root or ["/tmp/peanut-review"]
+    try:
+        gateway.serve(roots, host=args.host, port=args.port)
+    except (OSError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_ssh_probe(_args: argparse.Namespace) -> int:
+    from . import ssh_transport
+    return ssh_transport.main_probe()
+
+
+def cmd_ssh_run(_args: argparse.Namespace) -> int:
+    from . import ssh_transport
+    return ssh_transport.main_run()
+
+
+def cmd_ssh_stop(_args: argparse.Namespace) -> int:
+    from . import ssh_transport
+    return ssh_transport.main_stop()
+
+
+def cmd_ssh_recover(_args: argparse.Namespace) -> int:
+    from . import ssh_transport
+    return ssh_transport.main_recover()
+
+
+def cmd_ssh_transport(args: argparse.Namespace) -> int:
+    from . import ssh_transport
+    return ssh_transport.run_transport(args)
+
+
+def cmd_recover_ssh(args: argparse.Namespace) -> int:
+    session_dir = _get_session_dir(args)
+    from . import ssh_transport
+    failed = False
+    for agent in args.agent:
+        try:
+            result = ssh_transport.recover_agent(
+                session_dir, agent, grace_seconds=args.timeout,
+            )
+            count = len(result.get("recovered", []))
+            print(f"  {agent}: recovered {count} remote launch(es)")
+        except (OSError, ValueError) as exc:
+            failed = True
+            print(f"  {agent}: Error: {exc}", file=sys.stderr)
+    return 1 if failed else 0
+
+
 def cmd_archive(args: argparse.Namespace) -> int:
     """Export comments to git notes for peanut-review archival."""
     session_dir = _get_session_dir(args)
@@ -1343,7 +1632,7 @@ def cmd_archive(args: argparse.Namespace) -> int:
     for c in comments:
         note_data = json.dumps(dataclasses.asdict(c), indent=2)
         subprocess.run(
-            ["git", "-C", s.workspace, "notes", "--ref", ref,
+            ["git", "-C", sess.review_repo_path(s), "notes", "--ref", ref,
              "append", "-m", note_data, s.original_head],
             capture_output=True, text=True, timeout=10,
         )
@@ -1361,12 +1650,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     # init
     sp = sub.add_parser("init", help="Create a new review session")
-    sp.add_argument("--workspace", required=True, help="Repository path")
+    sp.add_argument("--workspace", required=True, help="Agent workspace root")
+    sp.add_argument(
+        "--repo-relative",
+        default=None,
+        help="Git repository path relative to --workspace (default: workspace)",
+    )
     sp.add_argument("--base", default=None,
                     help="Base ref (default: main, or PR baseRefOid with --gh-pr)")
     sp.add_argument("--topic", default=None,
                     help="Topic ref (default: HEAD, or PR headRefOid with --gh-pr)")
     sp.add_argument("--agents", help="Agent config JSON array (inline or file path)")
+    sp.add_argument(
+        "--ssh-targets",
+        help="SSH target config JSON object (inline or file path)",
+    )
     sp.add_argument("--personas-dir", help="Source dir for persona files")
     sp.add_argument("--timeout", type=int, default=1200, help="Agent timeout (default: 1200)")
     sp.add_argument("--id", default=None, metavar="SLUG",
@@ -1391,6 +1689,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="Launch only this configured agent (repeatable)",
     )
+
+    # curate
+    sp = sub.add_parser("curate", help="Launch the comment curator agent")
+    sp.add_argument("--dry-run", action="store_true", help="Print commands only")
+    sp.add_argument("--template", help="Curator prompt template path")
+    sp.add_argument("--cli-json", help="Path to cli.json for agent permissions")
 
     # rerun
     sp = sub.add_parser(
@@ -1458,12 +1762,28 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Only create the session; do not spawn agents")
     sp.add_argument("--reuse", action="store_true",
                     help="Reuse an existing session directory instead of refusing")
+    sp.add_argument(
+        "--sync",
+        action="store_true",
+        help="Synchronize an existing session to the PR's current base/head SHAs",
+    )
     sp.add_argument("--dry-run", action="store_true",
                     help="Print resolved init/launch commands without writing")
     sp.add_argument("--launch-dry-run", action="store_true",
                     help="Create/reuse the session, but print agent launch commands")
     sp.add_argument("--template", help="Agent prompt template path")
     sp.add_argument("--cli-json", help="Path to cli.json for agent permissions")
+
+    # sync-pr
+    sp = sub.add_parser(
+        "sync-pr",
+        help="Explicitly synchronize a session to its current GitHub PR snapshot",
+    )
+    sp.add_argument(
+        "pr",
+        nargs="?",
+        help="Optional PR spec override (defaults to the linked PR)",
+    )
 
     # add-comment
     sp = sub.add_parser("add-comment",
@@ -1480,11 +1800,6 @@ def build_parser() -> argparse.ArgumentParser:
                          "(file/line are inherited from the parent)")
     sp.add_argument("--body", help="Comment text (watch for shell-eaten backticks — prefer --body-file)")
     sp.add_argument("--body-file", help="Read comment text from FILE (safer for bodies with backticks or $ chars)")
-    sp.add_argument("--severity", default="suggestion",
-                    choices=["critical", "warning", "suggestion", "nit", "feedback"],
-                    help="Severity (default: suggestion). Use `feedback` "
-                         "for non-actionable observations (questions, FYI, "
-                         "praise) — not as a fallback for unsure findings.")
     sp.add_argument("--category", default="comment",
                     choices=["comment", "approve", "request-changes", "block", "blocking"],
                     help="Review category. approve/request-changes are only valid on global comments")
@@ -1495,11 +1810,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Add a high-level comment not tied to any file/line")
     sp.add_argument("--body", help="Comment text (watch for shell-eaten backticks — prefer --body-file)")
     sp.add_argument("--body-file", help="Read comment text from FILE (safer for bodies with backticks or $ chars)")
-    sp.add_argument("--severity", default="suggestion",
-                    choices=["critical", "warning", "suggestion", "nit", "feedback"],
-                    help="Severity (default: suggestion). Use `feedback` "
-                         "for non-actionable observations (questions, FYI, "
-                         "praise) — not as a fallback for unsure findings.")
     sp.add_argument("--category", default="comment",
                     choices=["comment", "approve", "request-changes", "block", "blocking"],
                     help="Review category (comment, approve, request-changes)")
@@ -1508,14 +1818,14 @@ def build_parser() -> argparse.ArgumentParser:
     # note
     sp = sub.add_parser(
         "note",
-        help="Record free-form agent activity outside the review comment stream",
+        help="Record a non-review agent report outside the comment stream",
     )
     sp.add_argument("--message", help="Note body")
     sp.add_argument("--file", help="Read note body from FILE, or '-' for stdin")
     sp.add_argument("--author", help="Author name (default: git config user.name)")
 
     # notes
-    sp = sub.add_parser("notes", help="List/filter free-form activity notes")
+    sp = sub.add_parser("notes", help="List/filter non-review agent reports")
     sp.add_argument("--agent", help="Filter by agent")
     sp.add_argument("--since", metavar="ID",
                     help="Return only notes posted after this note id")
@@ -1526,7 +1836,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("comments", help="List/filter comments")
     sp.add_argument("--agent", help="Filter by agent")
     sp.add_argument("--file", help="Filter by file")
-    sp.add_argument("--severity", help="Filter by severity")
     sp.add_argument("--category", choices=["comment", "approve", "request-changes", "block", "blocking"],
                     help="Filter by category (comment, approve, request-changes)")
     sp.add_argument("--since", metavar="ID",
@@ -1564,13 +1873,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # edit
     sp = sub.add_parser("edit",
-                        help="Rewrite a comment's body/severity, keeping the prior version in history")
+                        help="Rewrite a comment's body/category, keeping the prior version in history")
     sp.add_argument("comment_id", help="Comment ID to edit")
     sp.add_argument("--body", help="New comment text (watch for shell-eaten backticks — prefer --body-file)")
     sp.add_argument("--body-file", help="Read new comment text from FILE")
-    sp.add_argument("--severity", default=None,
-                    choices=["critical", "warning", "suggestion", "nit", "feedback"],
-                    help="New severity (omit to keep current)")
     sp.add_argument("--category", default=None,
                     choices=["comment", "approve", "request-changes", "block", "blocking"],
                     help="New category (approve/request-changes require a top-level global comment)")
@@ -1609,25 +1915,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("event", help="Event name")
     sp.add_argument("--timeout", type=int, default=600, help="Timeout seconds (default: 600)")
     sp.add_argument("--poll", type=float, default=2.0, help="Poll interval (default: 2)")
+    sp.add_argument(
+        "--max-reviewer-failures", type=int, default=0,
+        help="Allow this many terminal reviewer failures for round-done (default: 0); "
+             "unfinished reviewers and curator failure still fail the wait",
+    )
+    sp.add_argument(
+        "--no-curate",
+        action="store_true",
+        help="For GitHub sessions, do not auto-launch the curator after reviewer round-done",
+    )
 
     # signal-all
     sp = sub.add_parser("signal-all", help="Signal all agents")
     sp.add_argument("event", help="Event name")
-
-    # ask
-    sp = sub.add_parser("ask", help="Ask a question (blocks until reply)")
-    sp.add_argument("question", help="Question text")
-    sp.add_argument("--timeout", type=int, default=600, help="Timeout seconds (default: 600)")
-
-    # inbox
-    sp = sub.add_parser("inbox", help="Show unanswered questions")
-    sp.add_argument("--agent", help="Filter by agent")
-
-    # reply
-    sp = sub.add_parser("reply", help="Reply to a question")
-    sp.add_argument("--agent", required=True, help="Agent name")
-    sp.add_argument("--id", required=True, help="Question ID")
-    sp.add_argument("answer", help="Answer text")
 
     # verdict
     sp = sub.add_parser("verdict", help="Record final verdict")
@@ -1645,6 +1946,9 @@ def build_parser() -> argparse.ArgumentParser:
     # migrate
     sp = sub.add_parser("migrate", help="Update HEAD, mark comments stale")
     sp.add_argument("--new-head", help="New HEAD SHA (default: current HEAD)")
+
+    sp = sub.add_parser("retain-git", help="Retain pinned commits independently of the worktree")
+    sp.add_argument("--repo", help="Surviving repository or Git directory for session recovery")
 
     # status
     sp = sub.add_parser("status", help="Show session status")
@@ -1673,6 +1977,36 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--root", action="append", metavar="PATH",
                     help="Review root whose server to stop (same default as serve)")
 
+    # gateway-serve
+    sp = sub.add_parser(
+        "gateway-serve",
+        help="Run the capability-scoped reviewer gateway",
+    )
+    sp.add_argument("--host", default="127.0.0.1", help="Loopback bind host")
+    sp.add_argument("--port", type=int, default=27184, help="Bind port")
+    sp.add_argument(
+        "--root", action="append", metavar="PATH",
+        help="Review root containing session directories (repeatable)",
+    )
+
+    # Internal SSH commands. Payloads, including capabilities, are read from
+    # stdin so secrets never appear in argv.
+    sub.add_parser("ssh-probe", help=argparse.SUPPRESS)
+    sub.add_parser("ssh-run", help=argparse.SUPPRESS)
+    sub.add_parser("ssh-stop", help=argparse.SUPPRESS)
+    sub.add_parser("ssh-recover", help=argparse.SUPPRESS)
+    sp = sub.add_parser("ssh-transport", help=argparse.SUPPRESS)
+    sp.add_argument("--agent", required=True)
+    sp.add_argument("--launch-id", required=True)
+    sp.add_argument("--prompt-file", required=True)
+
+    sp = sub.add_parser(
+        "recover-ssh",
+        help="Stop and clean uncertain remote reviewer launches",
+    )
+    sp.add_argument("--agent", action="append", required=True, metavar="NAME")
+    sp.add_argument("--timeout", type=float, default=3.0)
+
     return p
 
 
@@ -1684,12 +2018,19 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 1
 
+    from . import gateway_cli
+    remote_result = gateway_cli.maybe_dispatch(args)
+    if remote_result is not None:
+        return remote_result
+
     handler = {
         "init": cmd_init,
         "launch": cmd_launch,
+        "curate": cmd_curate,
         "rerun": cmd_rerun,
         "kill-agents": cmd_kill_agents,
         "start": cmd_start,
+        "sync-pr": cmd_sync_pr,
         "add-comment": cmd_add_comment,
         "add-global-comment": cmd_add_global_comment,
         "note": cmd_note,
@@ -1707,15 +2048,20 @@ def main(argv: list[str] | None = None) -> int:
         "wait": cmd_wait,
         "wait-all": cmd_wait_all,
         "signal-all": cmd_signal_all,
-        "ask": cmd_ask,
-        "inbox": cmd_inbox,
-        "reply": cmd_reply,
         "verdict": cmd_verdict,
         "migrate": cmd_migrate,
         "status": cmd_status,
+        "retain-git": cmd_retain_git,
         "archive": cmd_archive,
         "serve": cmd_serve,
         "stop": cmd_stop,
+        "gateway-serve": cmd_gateway_serve,
+        "ssh-probe": cmd_ssh_probe,
+        "ssh-run": cmd_ssh_run,
+        "ssh-stop": cmd_ssh_stop,
+        "ssh-recover": cmd_ssh_recover,
+        "ssh-transport": cmd_ssh_transport,
+        "recover-ssh": cmd_recover_ssh,
     }.get(args.command)
 
     if handler is None:

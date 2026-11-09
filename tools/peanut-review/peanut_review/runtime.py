@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from . import polling, store
+from . import store
 from .models import AgentConfig, AgentStatus
 
 
@@ -19,9 +19,9 @@ PROCESS_EXITED = "exited"
 PROCESS_FAILED = "failed"
 PROCESS_TIMEOUT = "timeout"
 PROCESS_KILLED = "killed"
+PROCESS_STOPPED = "stopped"
 
 PROTOCOL_PENDING = "pending"
-PROTOCOL_ASKING = "asking"
 PROTOCOL_DONE = "done"
 
 _TERMINAL_PROCESS_STATES = {
@@ -29,6 +29,7 @@ _TERMINAL_PROCESS_STATES = {
     PROCESS_FAILED,
     PROCESS_TIMEOUT,
     PROCESS_KILLED,
+    PROCESS_STOPPED,
 }
 
 
@@ -57,14 +58,22 @@ def update_agent_meta(
     updates: dict[str, Any],
 ) -> dict[str, Any]:
     """Merge runtime fields into log/<agent>/meta.json atomically."""
+    import fcntl
+
     path = agent_meta_path(session_dir, agent_name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = read_agent_meta(session_dir, agent_name)
-    data.update(updates)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    tmp.replace(path)
-    return data
+    lock_path = path.with_suffix(".json.lock")
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            data = read_agent_meta(session_dir, agent_name)
+            data.update(updates)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+            tmp.replace(path)
+            return data
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _as_int(value: Any) -> int | None:
@@ -111,10 +120,6 @@ def has_round_done_signal(session_dir: str | Path, agent_name: str) -> bool:
 
 def agent_comment_count(session_dir: str | Path, agent_name: str) -> int:
     return sum(1 for c in store.read_agent_comments(session_dir, agent_name) if not c.deleted)
-
-
-def agent_unanswered_count(session_dir: str | Path, agent_name: str) -> int:
-    return len(polling.list_unanswered(session_dir, agent_name))
 
 
 def process_state_from_exit(
@@ -216,9 +221,6 @@ def inspect_agent_runtime(session_dir: str | Path, agent: AgentConfig) -> dict[s
         has_final_meta=has_final_meta,
     )
     protocol_status = PROTOCOL_DONE if signal else PROTOCOL_PENDING
-    unanswered = agent_unanswered_count(session_dir, agent.name)
-    if protocol_status == PROTOCOL_PENDING and unanswered:
-        protocol_status = PROTOCOL_ASKING
     return {
         "meta": meta,
         "pid": pid,
@@ -230,7 +232,6 @@ def inspect_agent_runtime(session_dir: str | Path, agent: AgentConfig) -> dict[s
         "protocol_status": protocol_status,
         "signal": signal,
         "comments": agent_comment_count(session_dir, agent.name),
-        "unanswered": unanswered,
         "exit_code": exit_code,
         "timed_out": timed_out,
         "termination_signal": termination_signal,
@@ -280,6 +281,18 @@ def compact_model(model: str, width: int = 22) -> str:
 
 def status_detail_parts(snapshot: dict[str, Any], status: str) -> list[str]:
     parts: list[str] = []
+    meta = snapshot["meta"]
+    if meta.get("transport") == "ssh":
+        target = meta.get("ssh_target") or "?"
+        channel = meta.get("ssh_channel_state") or "unknown"
+        remote = meta.get("remote_process_state") or "unknown"
+        parts.extend([
+            f"transport=ssh:{target}",
+            f"channel={channel}",
+            f"remote={remote}",
+        ])
+        if meta.get("ssh_cleanup_required"):
+            parts.append("cleanup=required")
     if snapshot["pid"] and (snapshot["reviewer_live"] or status == AgentStatus.RUNNING.value):
         parts.append(f"pid={snapshot['pid']}")
     if snapshot["pgid"] and (snapshot["reviewer_live"] or status == AgentStatus.RUNNING.value):
@@ -298,6 +311,4 @@ def status_detail_parts(snapshot: dict[str, Any], status: str) -> list[str]:
         parts.append(f"term={snapshot['termination_signal']}")
     parts.append(f"signal={'yes' if snapshot['signal'] else 'no'}")
     parts.append(f"comments={snapshot['comments']}")
-    if snapshot["unanswered"]:
-        parts.append(f"questions={snapshot['unanswered']}")
     return parts

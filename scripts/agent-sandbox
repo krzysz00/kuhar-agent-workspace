@@ -1,0 +1,859 @@
+#!/bin/bash
+# Sandboxed agent runner using bwrap (bubblewrap).
+#
+# Mounts the project, configured work tree and development drive read-write.
+# System tools and selected dotfiles are read-only. A private home contains
+# those dotfiles and writable overlays for harness state and caches.
+#
+# SETUP (one-time, requires sudo):
+#   Ubuntu 24.04+ blocks unprivileged user namespaces via AppArmor.
+#   Run setup-bwrap-apparmor.sh from this directory.
+#
+# Usage:
+#   agent-sandbox [--harness claude|opencode|codex] [--im-feeling-lucky] [--airgap|--no-network] [--memory-limit-gb N] [--reserve-cores N] [project-dir] [-- harness-args...]
+#   agent-sandbox claude|opencode|codex [--im-feeling-lucky] [--airgap|--no-network] [--memory-limit-gb N] [--reserve-cores N] [project-dir] [-- harness-args...]
+#
+# Examples:
+#   agent-sandbox ~/iree/constraints
+#   agent-sandbox ~/iree/constraints -- -p "fix the build"
+#   agent-sandbox --harness opencode ~/iree/constraints
+#   agent-sandbox codex ~/iree/constraints -- "fix the build"
+#   agent-sandbox --im-feeling-lucky ~/iree/constraints
+#   agent-sandbox  # uses current directory, or WORK_ROOT when launched from home
+
+set -euo pipefail
+
+# Load machine paths even when launched outside an initialized interactive shell.
+PATH_SETTINGS="${JAKUB_ENV_PATHS:-${XDG_CONFIG_HOME:-$HOME/.config}/jakub-env/paths.sh}"
+if [[ -r "$PATH_SETTINGS" ]]; then
+    # shellcheck source=/dev/null
+    source "$PATH_SETTINGS"
+fi
+# Derive the checkout root when the caller has not configured it.
+JAKUB_ENV_DIR="${JAKUB_ENV_DIR:-$(dirname "$(dirname "$(dirname "$(realpath "$0")")")")}"
+WORK_ROOT="${WORK_ROOT:-$HOME/work}"
+SANDBOX_DEV_ROOT="${AGENT_SANDBOX_DEV_ROOT:-/mnt/dev}"
+export JAKUB_ENV_DIR WORK_ROOT
+
+# --- Parse arguments ---
+usage() {
+    cat <<'EOF'
+Usage:
+  agent-sandbox [--harness claude|opencode|codex] [--im-feeling-lucky] [--airgap|--no-network] [--memory-limit-gb N] [--reserve-cores N] [project-dir] [-- harness-args...]
+  agent-sandbox claude|opencode|codex [--im-feeling-lucky] [--airgap|--no-network] [--memory-limit-gb N] [--reserve-cores N] [project-dir] [-- harness-args...]
+
+Options:
+  --harness, -H NAME       Select claude, opencode, or codex (machine default or claude)
+  --im-feeling-lucky      Use real gh/git/ssh credentials instead of sandbox credentials
+  --airgap, --no-network  Disable shell command networking and Codex web tools
+  --memory-limit-gb N     Limit aggregate agent process-tree cgroup memory to N GiB
+  --reserve-cores N       Reserve N complete physical cores for this harness
+  --benchmark            Add bpfland and fixed nominal clocks to --reserve-cores
+  --daemon               Own a persistent Codex daemon with phone remote control
+  -h, --help              Show this help
+
+All runs use a systemd cgroup to isolate OOM handling. --reserve-cores uses
+the system manager through a root helper; other runs use the user manager.
+The configured WORK_ROOT and AGENT_SANDBOX_DEV_ROOT (default /mnt/dev) are
+writable in every sandbox. AGENT_SANDBOX_HARNESS selects the default harness.
+Regular Codex launches use --no-daemon; --daemon explicitly owns a server here.
+--benchmark uses a stable profile with a 26-hour timeout and restores the host
+settings when the session exits. Benchmark commands use agent-reserved-run.
+
+Examples:
+  agent-sandbox ~/iree/constraints
+  agent-sandbox --harness opencode ~/iree/constraints
+  agent-sandbox --memory-limit-gb 16 ~/iree/constraints
+  agent-sandbox --reserve-cores 2 ~/rocjitsu/misc
+  agent-sandbox codex --daemon --reserve-cores 48 --benchmark
+  agent-sandbox codex ~/iree/constraints -- "fix the build"
+  agent-sandbox opencode ~/iree/constraints -- run "fix the build"
+EOF
+}
+
+PROJECT_DIR=""
+HARNESS="${AGENT_SANDBOX_HARNESS:-claude}"
+HARNESS_ARGS=()
+CODEX_DAEMON=false
+IM_FEELING_LUCKY=false
+AIRGAP=false
+MEMORY_LIMIT_GB=""
+MEMORY_LIMIT_SET=false
+RESERVE_CORES=""
+RESERVE_CORES_SET=false
+BENCHMARK=false
+ORIGINAL_ARGS=("$@")
+
+case "$0" in
+    /*) INVOCATION_PATH="$0" ;;
+    */*) INVOCATION_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+    *) INVOCATION_PATH="$(command -v "$0")" ;;
+esac
+
+script_name="$(basename "$0")"
+case "$script_name" in
+    opencode-sandbox) HARNESS="opencode" ;;
+    codex-sandbox) HARNESS="codex" ;;
+esac
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --harness|-H)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: $1 requires a harness name" >&2
+                exit 1
+            fi
+            HARNESS="$2"
+            shift 2
+            ;;
+        --harness=*)
+            HARNESS="${1#*=}"
+            shift
+            ;;
+        --daemon)
+            CODEX_DAEMON=true
+            shift
+            ;;
+        --benchmark)
+            BENCHMARK=true
+            shift
+            ;;
+        --im-feeling-lucky)
+            IM_FEELING_LUCKY=true
+            shift
+            ;;
+        --airgap|--no-network)
+            AIRGAP=true
+            shift
+            ;;
+        --memory-limit-gb)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: $1 requires a positive integer" >&2
+                exit 1
+            fi
+            MEMORY_LIMIT_GB="$2"
+            MEMORY_LIMIT_SET=true
+            shift 2
+            ;;
+        --memory-limit-gb=*)
+            MEMORY_LIMIT_GB="${1#*=}"
+            MEMORY_LIMIT_SET=true
+            shift
+            ;;
+        --reserve-cores)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: $1 requires a positive integer" >&2
+                exit 1
+            fi
+            RESERVE_CORES="$2"
+            RESERVE_CORES_SET=true
+            shift 2
+            ;;
+        --reserve-cores=*)
+            RESERVE_CORES="${1#*=}"
+            RESERVE_CORES_SET=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            HARNESS_ARGS=("$@")
+            break
+            ;;
+        *)
+            if [[ -z "$PROJECT_DIR" && ( "$1" == "claude" || "$1" == "opencode" || "$1" == "codex" ) && ! -d "$1" ]]; then
+                HARNESS="$1"
+            elif [[ -z "$PROJECT_DIR" ]]; then
+                PROJECT_DIR="$1"
+            else
+                echo "Error: unexpected argument '$1'" >&2
+                usage >&2
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if $CODEX_DAEMON && [[ "$HARNESS" != "codex" || ${#HARNESS_ARGS[@]} -ne 0 ]]; then
+    echo "Error: --daemon requires the codex harness and no harness arguments." >&2
+    exit 1
+fi
+
+if $CODEX_DAEMON && $AIRGAP; then
+    echo "Error: --daemon does not support --airgap." >&2
+    exit 1
+fi
+
+if $MEMORY_LIMIT_SET && [[ ! "$MEMORY_LIMIT_GB" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: --memory-limit-gb requires a positive integer (GiB), got '$MEMORY_LIMIT_GB'" >&2
+    exit 1
+fi
+if $RESERVE_CORES_SET && [[ ! "$RESERVE_CORES" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: --reserve-cores requires a positive physical-core count, got '$RESERVE_CORES'" >&2
+    exit 1
+fi
+if $BENCHMARK && ! $RESERVE_CORES_SET; then
+    echo "Error: --benchmark requires --reserve-cores." >&2
+    exit 1
+fi
+
+RESERVED_CHILD=false
+if [[ "${AGENT_SANDBOX_RESERVED_CHILD:-}" == "1" ]]; then
+    if ! grep -Eq '^0::/benchmark\.slice/agent-reserved-[^/]+\.scope(/session)?$' /proc/self/cgroup; then
+        echo "Error: reserved child marker is only valid inside benchmark.slice." >&2
+        exit 1
+    fi
+    RESERVED_CHILD=true
+fi
+if $BENCHMARK && $RESERVED_CHILD && [[ "${AGENT_SANDBOX_BENCHMARK_CHILD:-}" != "1" ]]; then
+    echo "Error: start --benchmark from the host, outside the existing reservation." >&2
+    exit 1
+fi
+
+if $RESERVE_CORES_SET && ! $RESERVED_CHILD; then
+    CPU_RESERVE_HELPER="${AGENT_CPU_RESERVE_HELPER:-/usr/local/libexec/agent-cpu-reserve}"
+    if [[ ! -x "$CPU_RESERVE_HELPER" ]]; then
+        echo "Error: --reserve-cores requires $CPU_RESERVE_HELPER" >&2
+        echo "Run scripts/setup-agent-cpu-reserve.sh outside the sandbox first." >&2
+        exit 1
+    fi
+    MEMORY_MAX="infinity"
+    if $MEMORY_LIMIT_SET; then
+        MEMORY_MAX="${MEMORY_LIMIT_GB}G"
+    fi
+    if $BENCHMARK; then
+        sudo -- "$CPU_RESERVE_HELPER" benchmark \
+            --cores "$RESERVE_CORES" \
+            --memory-max "$MEMORY_MAX" \
+            --scheduler bpfland --session \
+            --caller-pid "$$" \
+            -- /usr/bin/env AGENT_SANDBOX_BENCHMARK_CHILD=1 \
+            "$INVOCATION_PATH" "${ORIGINAL_ARGS[@]}"
+    else
+        sudo -- "$CPU_RESERVE_HELPER" run \
+            --cores "$RESERVE_CORES" \
+            --memory-max "$MEMORY_MAX" \
+            --caller-pid "$$" \
+            -- "$INVOCATION_PATH" "${ORIGINAL_ARGS[@]}"
+    fi
+    exit $?
+fi
+
+case "$HARNESS" in
+    claude|opencode|codex) ;;
+    *)
+        echo "Error: unknown harness '$HARNESS' (expected claude, opencode, or codex)" >&2
+        exit 1
+        ;;
+esac
+
+if [[ -z "$PROJECT_DIR" && "$PWD" == "$HOME" && -d "$WORK_ROOT" ]]; then
+    PROJECT_DIR="$WORK_ROOT"
+fi
+PROJECT_DIR="$(realpath "${PROJECT_DIR:-.}")"
+
+if [[ ! -d "$PROJECT_DIR" ]]; then
+    echo "Error: '$PROJECT_DIR' is not a directory" >&2
+    exit 1
+fi
+
+has_arg() {
+    local needle="$1"
+    shift
+
+    local arg
+    for arg in "$@"; do
+        [[ "$arg" == "$needle" ]] && return 0
+    done
+
+    return 1
+}
+
+codex_airgap_blocks_feature() {
+    case "$1" in
+        browser_use|browser_use_external|computer_use|image_generation|in_app_browser|standalone_web_search|search_tool|web_search_cached|web_search_request)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+codex_airgap_config_enables_blocked_feature() {
+    local config="$1"
+    local compact="${config//[[:space:]]/}"
+    local feature
+
+    for feature in browser_use browser_use_external computer_use image_generation in_app_browser standalone_web_search search_tool web_search_cached web_search_request; do
+        case "$compact" in
+            "features.$feature=true"|"features.$feature=1")
+                return 0
+                ;;
+        esac
+    done
+
+    case "$compact" in
+        "web_search=\"live\""|"web_search='live'"|"web_search=live"|"web_search=\"cached\""|"web_search='cached'"|"web_search=cached"|"web_search=true"|"web_search=1")
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+resolve_command() {
+    local env_name="$1"
+    local fallback="$2"
+    local resolved="${!env_name:-}"
+
+    if [[ -z "$resolved" ]]; then
+        resolved="$(command -v "$fallback" || true)"
+    fi
+
+    if [[ -z "$resolved" ]]; then
+        case "$fallback" in
+            claude) resolved="$HOME/.local/bin/claude" ;;
+            opencode) resolved="$HOME/.opencode/bin/opencode" ;;
+            codex) resolved="codex" ;;
+        esac
+    fi
+
+    if [[ "$resolved" == */* && ! -x "$resolved" ]]; then
+        echo "Error: $fallback not found at '$resolved' (set $env_name to override)." >&2
+        exit 1
+    fi
+
+    if [[ "$resolved" != */* ]] && ! command -v "$resolved" >/dev/null 2>&1; then
+        echo "Error: $fallback not found (set $env_name to override)." >&2
+        exit 1
+    fi
+
+    printf '%s\n' "$resolved"
+}
+
+# --- Harness command ---
+AGENT_CMD=()
+case "$HARNESS" in
+    claude)
+        CLAUDE_BIN="$(resolve_command CLAUDE_BIN claude)"
+        AGENT_CMD=("$CLAUDE_BIN" --dangerously-skip-permissions "${HARNESS_ARGS[@]}")
+        ;;
+    opencode)
+        OPENCODE_BIN="$(resolve_command OPENCODE_BIN opencode)"
+        OPENCODE_ARGS=("${HARNESS_ARGS[@]}")
+        if [[ "${OPENCODE_ARGS[0]:-}" == "run" ]] \
+            && ! has_arg --dangerously-skip-permissions "${OPENCODE_ARGS[@]}" \
+            && ! has_arg --help "${OPENCODE_ARGS[@]}" \
+            && ! has_arg -h "${OPENCODE_ARGS[@]}"; then
+            OPENCODE_ARGS=(run --dangerously-skip-permissions "${OPENCODE_ARGS[@]:1}")
+        fi
+        AGENT_CMD=("$OPENCODE_BIN" "${OPENCODE_ARGS[@]}")
+        ;;
+    codex)
+        CODEX_BIN="$(resolve_command CODEX_BIN codex)"
+        if $CODEX_DAEMON; then
+            CODEX_RUNNER_DIR="$(dirname "$(readlink -f "$INVOCATION_PATH")")"
+            AGENT_CMD=("$CODEX_RUNNER_DIR/agent-codex-daemon" "$CODEX_BIN" "$PROJECT_DIR" "$INVOCATION_PATH" "$PWD" "${ORIGINAL_ARGS[@]}")
+        else
+            CODEX_ARGS=(--no-daemon)
+            CODEX_HAS_CD=false
+            CODEX_HAS_SANDBOX_OVERRIDE=false
+            CODEX_HAS_APPROVAL_OVERRIDE=false
+            CODEX_AIRGAP_WEB_TOOL_OVERRIDE=false
+            CODEX_EXPECTS_SANDBOX_VALUE=false
+            CODEX_EXPECTS_ENABLE_VALUE=false
+            CODEX_EXPECTS_CONFIG_VALUE=false
+            for arg in "${HARNESS_ARGS[@]}"; do
+                if $CODEX_EXPECTS_SANDBOX_VALUE; then
+                    CODEX_EXPECTS_SANDBOX_VALUE=false
+                    continue
+                fi
+                if $CODEX_EXPECTS_ENABLE_VALUE; then
+                    if codex_airgap_blocks_feature "$arg"; then
+                        CODEX_AIRGAP_WEB_TOOL_OVERRIDE=true
+                    fi
+                    CODEX_EXPECTS_ENABLE_VALUE=false
+                    continue
+                fi
+                if $CODEX_EXPECTS_CONFIG_VALUE; then
+                    if codex_airgap_config_enables_blocked_feature "$arg"; then
+                        CODEX_AIRGAP_WEB_TOOL_OVERRIDE=true
+                    fi
+                    CODEX_EXPECTS_CONFIG_VALUE=false
+                    continue
+                fi
+
+                case "$arg" in
+                    --remote|--remote=*)
+                        echo "Error: --remote connects to another server; use --daemon to start a server inside this sandbox." >&2
+                        exit 1
+                        ;;
+                    --cd|--cd=*|-C) CODEX_HAS_CD=true ;;
+                    --search) CODEX_AIRGAP_WEB_TOOL_OVERRIDE=true ;;
+                    --enable) CODEX_EXPECTS_ENABLE_VALUE=true ;;
+                    --enable=*)
+                        if codex_airgap_blocks_feature "${arg#*=}"; then
+                            CODEX_AIRGAP_WEB_TOOL_OVERRIDE=true
+                        fi
+                        ;;
+                    -c|--config) CODEX_EXPECTS_CONFIG_VALUE=true ;;
+                    --config=*)
+                        if codex_airgap_config_enables_blocked_feature "${arg#*=}"; then
+                            CODEX_AIRGAP_WEB_TOOL_OVERRIDE=true
+                        fi
+                        ;;
+                    --sandbox|-s)
+                        CODEX_HAS_SANDBOX_OVERRIDE=true
+                        CODEX_EXPECTS_SANDBOX_VALUE=true
+                        ;;
+                    --sandbox=*)
+                        CODEX_HAS_SANDBOX_OVERRIDE=true
+                        ;;
+                    --full-auto)
+                        CODEX_HAS_SANDBOX_OVERRIDE=true
+                        CODEX_HAS_APPROVAL_OVERRIDE=true
+                        ;;
+                    --dangerously-bypass-approvals-and-sandbox)
+                        CODEX_HAS_SANDBOX_OVERRIDE=true
+                        ;;
+                    --ask-for-approval|--ask-for-approval=*|-a) CODEX_HAS_APPROVAL_OVERRIDE=true ;;
+                esac
+            done
+            if $AIRGAP && $CODEX_AIRGAP_WEB_TOOL_OVERRIDE; then
+                echo "Error: codex airgap mode disables Codex web/search/browser tools; remove --search or blocked feature overrides." >&2
+                exit 1
+            fi
+            if ! $CODEX_HAS_CD; then
+                CODEX_ARGS+=(--cd "$PROJECT_DIR")
+            fi
+            if $AIRGAP; then
+                CODEX_ARGS+=(-c 'web_search="disabled"')
+                for feature in browser_use browser_use_external computer_use image_generation in_app_browser standalone_web_search search_tool; do
+                    CODEX_ARGS+=(--disable "$feature")
+                done
+                if ! $CODEX_HAS_SANDBOX_OVERRIDE; then
+                    CODEX_ARGS+=(--sandbox danger-full-access)
+                fi
+                if ! $CODEX_HAS_APPROVAL_OVERRIDE; then
+                    CODEX_ARGS+=(--ask-for-approval never)
+                fi
+            elif ! $CODEX_HAS_SANDBOX_OVERRIDE; then
+                CODEX_ARGS+=(--dangerously-bypass-approvals-and-sandbox)
+            fi
+            CODEX_ARGS+=("${HARNESS_ARGS[@]}")
+            AGENT_CMD=("$CODEX_BIN" "${CODEX_ARGS[@]}")
+        fi
+        ;;
+esac
+
+# --- Preflight check ---
+if ! /usr/bin/bwrap --ro-bind / / -- true 2>/dev/null; then
+    echo "Error: bwrap cannot create user namespaces." >&2
+    echo "Check the host's user-namespace policy. Ubuntu AppArmor setup is described in setup-bwrap-apparmor.sh." >&2
+    exit 1
+fi
+
+if $IM_FEELING_LUCKY; then
+    echo "🎲 Sandboxed $HARNESS (with real credentials) in: $PROJECT_DIR"
+else
+    echo "Sandboxed $HARNESS in: $PROJECT_DIR"
+fi
+if $AIRGAP; then
+    if [[ "$HARNESS" == "codex" ]]; then
+        if $CODEX_HAS_SANDBOX_OVERRIDE; then
+            echo "  Network: enabled for codex control plane; Codex web tools disabled; shell commands use caller-provided Codex sandbox"
+        else
+            echo "  Network: enabled for codex control plane and shell commands; Codex web tools disabled; filesystem/devices rely on bwrap"
+        fi
+    else
+        echo "  Network: disabled"
+    fi
+fi
+if $MEMORY_LIMIT_SET; then
+    echo "  Memory: ${MEMORY_LIMIT_GB} GiB aggregate process-tree limit"
+else
+    echo "  Memory: unlimited"
+fi
+if $RESERVE_CORES_SET; then
+    echo "  CPU isolation: ${RESERVE_CORES} physical core(s) (${AGENT_SANDBOX_RESERVED_CPUS})"
+    echo "  Reserved commands: agent-reserved-run COMMAND ..."
+fi
+echo "  OOM policy: prefer and kill the whole agent cgroup"
+
+# --- Detect git worktrees with git dirs outside the project ---
+GIT_DIR_BINDS=()
+add_git_dir_bind() {
+    local label="$1"
+    local path="$2"
+    local existing
+
+    [[ -d "$path" ]] || return 0
+    case "$path" in "$PROJECT_DIR"/*) return 0 ;; esac
+    for existing in "${GIT_DIR_BIND_PATHS[@]}"; do
+        [[ "$existing" == "$path" ]] && return 0
+    done
+
+    GIT_DIR_BIND_PATHS+=("$path")
+    GIT_DIR_BINDS+=(--bind "$path" "$path")
+    echo "  $label: $path"
+}
+
+GIT_DIR_BIND_PATHS=()
+for gitfile in "$PROJECT_DIR/.git" "$PROJECT_DIR"/*/.git; do
+    [[ -f "$gitfile" ]] || continue
+    repo_dir="$(dirname "$gitfile")"
+    git_dir="$(cd "$repo_dir" && realpath "$(git rev-parse --git-dir)" 2>/dev/null)" || continue
+    git_common_dir="$(cd "$repo_dir" && realpath "$(git rev-parse --git-common-dir)" 2>/dev/null)" || continue
+    add_git_dir_bind "Worktree git dir" "$git_dir"
+    add_git_dir_bind "Worktree common git dir" "$git_common_dir"
+done
+
+if [[ "$HARNESS" == "codex" && "$CODEX_DAEMON" == false && ${#GIT_DIR_BIND_PATHS[@]} -gt 0 ]]; then
+    CODEX_ADD_DIR_ARGS=()
+    for path in "${GIT_DIR_BIND_PATHS[@]}"; do
+        CODEX_ADD_DIR_ARGS+=(--add-dir "$path")
+    done
+    AGENT_CMD=("${AGENT_CMD[0]}" "${CODEX_ADD_DIR_ARGS[@]}" "${AGENT_CMD[@]:1}")
+fi
+
+# --- Build bwrap command ---
+# On this system /bin, /lib, /lib64 are symlinks into /usr, so binding
+# /usr and recreating the symlinks is sufficient for all system tools.
+
+path_exists() {
+    [[ -e "$1" || -L "$1" ]]
+}
+
+add_bind_if_exists() {
+    local mode="$1"
+    local source="$2"
+    local dest="${3:-$source}"
+
+    path_exists "$source" || return 0
+
+    if [[ -d "$source" ]]; then
+        BWRAP_ARGS+=("$mode" "$source" "$dest")
+        return 0
+    fi
+
+    # File mount destinations do not exist under the private home tmpfs yet.
+    # Data binds create the file inside the sandbox without exposing its parent.
+    case "$mode" in
+        --ro-bind)
+            add_file_data_bind --ro-bind-data "$source" "$dest"
+            ;;
+        --bind)
+            add_file_data_bind --bind-data "$source" "$dest"
+            ;;
+        *)
+            BWRAP_ARGS+=("$mode" "$source" "$dest")
+            ;;
+    esac
+}
+
+add_file_data_bind() {
+    local mode="$1"
+    local source="$2"
+    local dest="$3"
+    local fd
+
+    [[ -r "$source" ]] || return 0
+
+    exec {fd}<"$source"
+    BWRAP_DATA_FDS+=("$fd")
+    BWRAP_ARGS+=("$mode" "$fd" "$dest")
+}
+
+add_env_if_set() {
+    local name="$1"
+
+    if [[ ${!name+x} ]]; then
+        BWRAP_ARGS+=(--setenv "$name" "${!name}")
+    fi
+}
+
+BWRAP_DATA_FDS=()
+BWRAP_ARGS=(
+    --ro-bind /usr /usr
+    --symlink usr/bin /bin
+    --symlink usr/lib /lib
+    --symlink usr/lib64 /lib64
+    --ro-bind /etc /etc
+    --proc /proc
+    --ro-bind /sys /sys
+    --dev /dev
+    --dev-bind-try /dev/dri /dev/dri
+    --dev-bind-try /dev/kfd /dev/kfd
+    --dev-bind-try /dev/nvidia0 /dev/nvidia0
+    --dev-bind-try /dev/nvidiactl /dev/nvidiactl
+    --dev-bind-try /dev/nvidia-uvm /dev/nvidia-uvm
+    --dev-bind-try /dev/nvidia-uvm-tools /dev/nvidia-uvm-tools
+    --dev-bind-try /dev/nvidia-modeset /dev/nvidia-modeset
+)
+
+# Use the matching helper inside the sandbox without changing the host install.
+if [[ -f /usr/local/bin/agent-reserved-run ]]; then
+    RESERVED_RUN_SOURCE="$(dirname "$(readlink -f "$INVOCATION_PATH")")/agent-reserved-run"
+    if [[ -r "$RESERVED_RUN_SOURCE" ]]; then
+        BWRAP_ARGS+=(--perms 0755)
+        add_file_data_bind --ro-bind-data "$RESERVED_RUN_SOURCE" /usr/local/bin/agent-reserved-run
+    fi
+fi
+
+# Bind the directory, so existing sandboxes see a socket recreated by a later
+# host session. Setup creates this directory even while no session is active.
+add_bind_if_exists --ro-bind /run/agent-cpu-reserve /run/agent-cpu-reserve
+BROKER_SOURCE="$(dirname "$(readlink -f "$INVOCATION_PATH")")/agent-reservation-broker.py"
+if [[ -r "$BROKER_SOURCE" && -f /usr/local/libexec/agent-reservation-broker.py ]]; then
+    add_file_data_bind --ro-bind-data "$BROKER_SOURCE" /usr/local/libexec/agent-reservation-broker.py
+fi
+
+# Preserve the host locks' inodes: --ro-bind-data would create a private copy and
+# allow benchmarks in different sandboxes to overlap despite taking flock.
+for lock_file in /run/agent-reserved-workload.lock /run/lock/agent-cpu-reserve.lock; do
+    if [[ -r "$lock_file" ]]; then
+        BWRAP_ARGS+=(--ro-bind "$lock_file" "$lock_file")
+    fi
+done
+
+add_bind_if_exists --ro-bind /opt /opt
+# Codex needs network for its control plane. In airgap mode, keep Codex in the
+# outer bwrap sandbox only so ROCm runtime dispatch can open GPU device nodes.
+if $AIRGAP && [[ "$HARNESS" != "codex" ]]; then
+    BWRAP_ARGS+=(--unshare-net --tmpfs /tmp)
+else
+    BWRAP_ARGS+=(--bind /tmp /tmp)
+    add_bind_if_exists --ro-bind /run/systemd/resolve /run/systemd/resolve
+fi
+
+# --- Home dotfiles (read-only) ---
+BWRAP_ARGS+=(--tmpfs "$HOME")
+for path in \
+    "$HOME/.bash_aliases" \
+    "$HOME/.bashrc" \
+    "$HOME/.zshrc" \
+    "$HOME/.zprofile" \
+    "$HOME/.zshenv" \
+    "$HOME/.p10k.zsh" \
+    "$HOME/.cargo" \
+    "$HOME/.config" \
+    "$HOME/.gitconfig" \
+    "$HOME/.git-hooks" \
+    "$HOME/.git-confidential-patterns" \
+    "$HOME/.local" \
+    "$HOME/.nvm" \
+    "$HOME/.profile" \
+    "$HOME/.rustup" \
+    "$HOME/.steam" \
+    "$HOME/.tmux" \
+    "$HOME/go" \
+    "$HOME/new-the-rock" ; do
+    add_bind_if_exists --ro-bind "$path" "$path"
+done
+
+# --- Credential binds (real vs sandbox) ---
+if $IM_FEELING_LUCKY; then
+    add_bind_if_exists --ro-bind "$HOME/.config/gh" "$HOME/.config/gh"
+    add_bind_if_exists --ro-bind "$HOME/.gitconfig.local" "$HOME/.gitconfig.local"
+    add_bind_if_exists --ro-bind "$HOME/.ssh" "$HOME/.ssh"
+else
+    add_bind_if_exists --bind "$HOME/.config/gh-sandbox" "$HOME/.config/gh"
+    add_bind_if_exists --ro-bind "$HOME/.gitconfig-sandbox.local" "$HOME/.gitconfig.local"
+    add_bind_if_exists --ro-bind "$HOME/.ssh-sandbox" "$HOME/.ssh"
+fi
+
+# --- Writable work roots ---
+for path in "$WORK_ROOT" "$SANDBOX_DEV_ROOT"; do
+    add_bind_if_exists --bind "$path" "$path"
+done
+
+# Dotfile symlink targets outside the writable work roots still need visibility.
+for path in \
+    "$JAKUB_ENV_DIR" \
+    "$HOME/bin"; do
+    if [[ "$path" == "$WORK_ROOT" || "$path" == "$WORK_ROOT/"* ||
+          "$path" == "$SANDBOX_DEV_ROOT" || "$path" == "$SANDBOX_DEV_ROOT/"* ]]; then
+        continue
+    fi
+    add_bind_if_exists --ro-bind "$path" "$path"
+done
+
+for path in \
+    "${LLVMS:-$HOME/llvm}" \
+    "${IREES:-$HOME/iree}" \
+    "${ROCJITSUS:-$HOME/rocjitsu}" \
+    "${PR_ROOT:-$HOME/reviews}" \
+    "$HOME/llvm" \
+    "$HOME/iree" \
+    "$HOME/rocjitsu"; do
+    if [[ "$path" == "$WORK_ROOT" || "$path" == "$WORK_ROOT/"* ||
+          "$path" == "$SANDBOX_DEV_ROOT" || "$path" == "$SANDBOX_DEV_ROOT/"* ]]; then
+        continue
+    fi
+    add_bind_if_exists --bind "$path" "$path"
+done
+
+# --- Read-write overlays ---
+BWRAP_ARGS+=(--bind "$PROJECT_DIR" "$PROJECT_DIR")
+BWRAP_ARGS+=("${GIT_DIR_BINDS[@]}")
+for path in \
+    "$HOME/projects" \
+    "$HOME/.cache" \
+    "$HOME/.ccache" \
+    "$HOME/.claude" \
+    "$HOME/.claude.json" \
+    "$HOME/.opencode" \
+    "$HOME/.config/opencode" \
+    "$HOME/.codex" \
+    "$HOME/.local/share/direnv" \
+    "$HOME/.local/state/claude" \
+    "$HOME/.local/share/opencode"; do
+    add_bind_if_exists --bind "$path" "$path"
+done
+if [[ -n "${CODEX_HOME:-}" && "$CODEX_HOME" != "$HOME/.codex" ]]; then
+    add_bind_if_exists --bind "$CODEX_HOME" "$CODEX_HOME"
+fi
+
+# --- Windows games and compatibility runtimes ---
+# Prefixes, saves, Proton fixes, and Steam runtime updates need writable storage.
+for path in \
+    "$HOME/Games" \
+    "$HOME/.local/share/Steam/compatibilitytools.d" \
+    "$HOME/.local/share/umu"; do
+    add_bind_if_exists --bind "$path" "$path"
+done
+
+# Share the desktop sockets needed by Wine/Proton while keeping the rest of
+# the user runtime directory private. X11 sockets are in the shared /tmp.
+if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "$XDG_RUNTIME_DIR" ]]; then
+    BWRAP_ARGS+=(--perms 0700 --dir "$XDG_RUNTIME_DIR")
+    add_bind_if_exists --bind "$XDG_RUNTIME_DIR/pulse" "$XDG_RUNTIME_DIR/pulse"
+    for socket in "${WAYLAND_DISPLAY:-wayland-0}" pipewire-0; do
+        case "$socket" in
+            /*) socket_path="$socket" ;;
+            *) socket_path="$XDG_RUNTIME_DIR/$socket" ;;
+        esac
+        if [[ -S "$socket_path" ]]; then
+            BWRAP_ARGS+=(--bind "$socket_path" "$socket_path")
+        fi
+    done
+fi
+if [[ -n "${XAUTHORITY:-}" ]]; then
+    add_bind_if_exists --ro-bind "$XAUTHORITY" "$XAUTHORITY"
+fi
+
+# --- Environment ---
+BWRAP_ARGS+=(
+    --clearenv
+    --setenv HOME "$HOME"
+    --setenv USER "${USER:-$(id -un)}"
+    --setenv LOGNAME "${LOGNAME:-${USER:-$(id -un)}}"
+    --setenv SHELL "${SHELL:-/bin/bash}"
+    --setenv PATH "$HOME/.local/bin:$HOME/.opencode/bin:$HOME/bin:${PATH:-/usr/local/bin:/usr/bin:/bin}"
+)
+
+for name in \
+    LANG \
+    LC_ALL \
+    LC_CTYPE \
+    TZ \
+    TERM \
+    COLORTERM \
+    DISPLAY \
+    WAYLAND_DISPLAY \
+    XAUTHORITY \
+    XDG_RUNTIME_DIR \
+    DBUS_SESSION_BUS_ADDRESS \
+    PULSE_SERVER \
+    NO_COLOR \
+    EDITOR \
+    VISUAL \
+    PAGER \
+    LESS \
+    BAT_THEME \
+    GH_PAGER \
+    GIT_PAGER \
+    BROWSER \
+    NVM_DIR \
+    NVM_BIN \
+    NVM_INC \
+    NVM_CD_FLAGS \
+    JAKUB_ENV_DIR \
+    JAKUB_ENV_PATHS \
+    WORK_ROOT \
+    LLVMS \
+    IREES \
+    ROCJITSUS \
+    PR_ROOT \
+    CODEX_HOME \
+    AGENT_SANDBOX_HARNESS \
+    AGENT_SANDBOX_DEV_ROOT \
+    VIRTUAL_ENV \
+    ROCM_PATH \
+    ROCM_HOME \
+    CMAKE_PREFIX_PATH \
+    LD_LIBRARY_PATH \
+    CCACHE_DIR \
+    CCACHE_BASEDIR \
+    CCACHE_NOHASHDIR \
+    CCACHE_MAXSIZE \
+    UV_CACHE_DIR \
+    UV_PYTHON_INSTALL_DIR \
+    AGENT_SANDBOX_RESERVED_CPUS \
+    AGENT_RESERVED_CPUS \
+    ANTHROPIC_API_KEY \
+    OPENAI_API_KEY; do
+    add_env_if_set "$name"
+done
+
+BWRAP_ARGS+=(
+    --chdir "$PROJECT_DIR"
+    --die-with-parent
+)
+
+CHOOM_BIN="$(command -v choom || true)"
+
+if [[ -z "$CHOOM_BIN" ]]; then
+    echo "Error: agent-sandbox requires choom to configure OOM victim preference." >&2
+    exit 1
+fi
+
+MEMORY_MAX="infinity"
+if $MEMORY_LIMIT_SET; then
+    MEMORY_MAX="${MEMORY_LIMIT_GB}G"
+fi
+
+if $RESERVED_CHILD; then
+    exec "$CHOOM_BIN" -n 1000 -- \
+        /usr/bin/bwrap "${BWRAP_ARGS[@]}" -- "${AGENT_CMD[@]}"
+fi
+
+SYSTEMD_RUN_BIN="$(command -v systemd-run || true)"
+SYSTEMCTL_BIN="$(command -v systemctl || true)"
+
+if [[ -z "$SYSTEMD_RUN_BIN" || -z "$SYSTEMCTL_BIN" ]]; then
+    echo "Error: agent-sandbox requires systemd-run, systemctl, and a running systemd user manager." >&2
+    exit 1
+fi
+if ! "$SYSTEMCTL_BIN" --user show-environment >/dev/null 2>&1; then
+    echo "Error: agent-sandbox requires an accessible systemd user manager." >&2
+    exit 1
+fi
+
+# A transient scope puts bwrap, the agent, and every descendant in one cgroup.
+# MemoryMax is infinite by default, while OOMPolicy keeps the tree indivisible
+# and choom makes it the preferred victim if the host encounters global OOM.
+exec "$SYSTEMD_RUN_BIN" \
+    --user \
+    --scope \
+    --quiet \
+    --collect \
+    --property=OOMPolicy=kill \
+    --property="MemoryMax=$MEMORY_MAX" \
+    -- \
+    "$CHOOM_BIN" -n 1000 -- \
+    /usr/bin/bwrap "${BWRAP_ARGS[@]}" -- "${AGENT_CMD[@]}"
