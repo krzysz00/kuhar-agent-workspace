@@ -235,7 +235,6 @@ def test_launch_dry_run_notes_die_with_parent_sandbox_but_runs():
     assert "Run the spawn command outside the sandbox:" in text
     assert "vera: dry-run" in text
 
-
 def test_curate_cli_launches_curator():
     sd = os.path.join(tempfile.mkdtemp(prefix="pr-test-"), "session")
     _init_session(sd, workspace=_make_cursor_workspace(), agents=[
