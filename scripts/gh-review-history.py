@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Collect GitHub code review history and output as markdown.
+"""Collect a user's GitHub code review history and output as markdown.
 
 Usage:
-    python3 gh-review-history.py USERNAME[,USERNAME...] ORG [-d DAYS] [-n COUNT] [-o DIR] [--retry] [-v]
+    python3 gh-review-history.py USERNAME ORG [-d DAYS] [-n COUNT] [-o DIR] [-v]
 
 Specify -d for time-based collection, -n for count-based, or both.
-Normal collection defaults to -d 7 when neither is given.
+Defaults to -d 7 when neither is given.
 
 Requires: gh CLI installed and authenticated.
 """
@@ -14,8 +14,6 @@ import argparse
 import concurrent.futures
 import json
 import os
-import re
-import shlex
 import subprocess
 import sys
 import threading
@@ -32,7 +30,7 @@ def run_gh(args, verbose=False):
     """Run a gh CLI command and return parsed JSON output."""
     cmd = ["gh"] + args
     if verbose:
-        log(f"  $ {shlex.join(cmd)}")
+        log(f"  $ {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         stderr = result.stderr.strip()
@@ -57,64 +55,10 @@ def check_gh():
 
 
 GH_SEARCH_MAX = 1000  # GitHub search API hard limit per query
-INDEX_TABLE_ROW_RE = re.compile(r"\[([^#\]]+)#(\d+)\]\(([^)]+)\)")
-PR_FILENAME_RE = re.compile(r"^(?P<repo>.+)-PR(?P<number>\d+)\.md$")
 
 
-def parse_usernames(value):
-    """Parse a comma-separated username list, preserving order."""
-    usernames = []
-    seen = set()
-    for raw_username in value.split(","):
-        username = raw_username.strip()
-        if not username:
-            continue
-        key = username.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        usernames.append(username)
-    if not usernames:
-        raise argparse.ArgumentTypeError("at least one username is required")
-    return usernames
-
-
-def format_usernames(usernames):
-    return ", ".join(usernames)
-
-
-def target_login_set(usernames):
-    return {username.lower() for username in usernames}
-
-
-def is_target_login(login, target_logins):
-    return (login or "").lower() in target_logins
-
-
-def parse_int(value, default=0):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def build_reviewed_by_query_args(usernames):
-    """Build reviewed-by query args for one or more users.
-
-    gh's --reviewed-by flag accepts one user. For multiple users, pass the
-    GitHub search OR expression as separate query args so gh does not parse the
-    whole expression as one reviewed-by value.
-    """
-    args = []
-    for username in usernames:
-        if args:
-            args.append("OR")
-        args.append(f"reviewed-by:{username}")
-    return args
-
-
-def search_reviewed_prs(usernames, org, since_date, max_count, verbose):
-    """Search for PRs reviewed by any target user in the given org.
+def search_reviewed_prs(username, org, since_date, max_count, verbose):
+    """Search for PRs reviewed by the user in the given org.
 
     Args:
         since_date: If set, only return PRs updated after this date.
@@ -123,12 +67,10 @@ def search_reviewed_prs(usernames, org, since_date, max_count, verbose):
     When since_date is set and results might exceed 1000, the date range is
     chunked into smaller windows to work around the GitHub search API limit.
     """
-    reviewed_by_query_args = build_reviewed_by_query_args(usernames)
-
     def _search(since_str=None, until_str=None, limit=GH_SEARCH_MAX):
         cmd = [
             "search", "prs",
-            *reviewed_by_query_args,
+            f"--reviewed-by={username}",
             f"--owner={org}",
             f"--limit={limit}",
             "--json=number,title,url,repository,state,updatedAt",
@@ -139,27 +81,26 @@ def search_reviewed_prs(usernames, org, since_date, max_count, verbose):
             cmd.append(f"--updated=>{since_str}")
         return run_gh(cmd, verbose)
 
-    cap = max_count
+    cap = max_count or GH_SEARCH_MAX
 
     if since_date:
         date_str = since_date.strftime("%Y-%m-%d")
-        log(f"Searching PRs reviewed by {format_usernames(usernames)} in {org} since {date_str}...", verbose)
+        log(f"Searching PRs reviewed by {username} in {org} since {date_str}...", verbose)
     else:
-        limit_desc = cap if cap is not None else GH_SEARCH_MAX
-        log(f"Searching last {limit_desc} PRs reviewed by {format_usernames(usernames)} in {org}...", verbose)
+        log(f"Searching last {cap} PRs reviewed by {username} in {org}...", verbose)
 
     try:
         if not since_date:
             # Count-only mode: single search, capped.
-            data = _search(limit=min(cap or GH_SEARCH_MAX, GH_SEARCH_MAX))
+            data = _search(limit=min(cap, GH_SEARCH_MAX))
         else:
             # Time-based: try a single search first.
             data = _search(since_str=since_date.strftime("%Y-%m-%d"),
-                           limit=min(cap or GH_SEARCH_MAX, GH_SEARCH_MAX))
+                           limit=min(cap, GH_SEARCH_MAX))
             # If we hit the 1000-result ceiling, chunk by month.
-            if len(data) >= GH_SEARCH_MAX and (cap is None or cap > GH_SEARCH_MAX):
+            if len(data) >= GH_SEARCH_MAX and (not max_count or cap > GH_SEARCH_MAX):
                 log(f"  Hit {GH_SEARCH_MAX}-result limit, chunking by month...", verbose)
-                data = _chunked_search(since_date, cap, verbose, _search)
+                data = _chunked_search(username, org, since_date, cap, verbose, _search)
     except RuntimeError as e:
         if "rate limit" in str(e).lower():
             print(f"Error: {e}", file=sys.stderr)
@@ -184,18 +125,17 @@ def search_reviewed_prs(usernames, org, since_date, max_count, verbose):
     return unique
 
 
-def _chunked_search(since_date, cap, verbose, search_fn):
+def _chunked_search(username, org, since_date, cap, verbose, search_fn):
     """Break the date range into monthly chunks to get past the 1000-result limit."""
     now = datetime.now(timezone.utc)
     all_data = []
     chunk_start = since_date
-    while chunk_start < now and (cap is None or len(all_data) < cap):
+    while chunk_start < now and len(all_data) < cap:
         chunk_end = min(chunk_start + timedelta(days=30), now)
         s = chunk_start.strftime("%Y-%m-%d")
         e = chunk_end.strftime("%Y-%m-%d")
-        remaining = (cap - len(all_data)) if cap is not None else GH_SEARCH_MAX
-        need_desc = remaining if cap is not None else "all"
-        log(f"  Chunk {s} .. {e} (have {len(all_data)}, need up to {need_desc} more)", verbose)
+        remaining = cap - len(all_data)
+        log(f"  Chunk {s} .. {e} (have {len(all_data)}, need up to {remaining} more)", verbose)
         chunk = search_fn(since_str=s, until_str=e,
                           limit=min(remaining, GH_SEARCH_MAX))
         all_data.extend(chunk)
@@ -206,28 +146,7 @@ def _chunked_search(since_date, cap, verbose, search_fn):
     return all_data
 
 
-def fetch_pr_details(owner, repo, number, verbose):
-    """Fetch PR metadata and normalize it to the search result shape."""
-    data = run_gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], verbose)
-    return {
-        "number": data.get("number", number),
-        "title": data.get("title", "Untitled"),
-        "url": data.get("html_url", ""),
-        "repository": {"nameWithOwner": f"{owner}/{repo}"},
-        "state": data.get("state", "unknown"),
-        "updatedAt": data.get("updated_at", ""),
-    }
-
-
-def ensure_pr_details(pr, verbose):
-    """Fetch full PR metadata when retry loaded only index summary data."""
-    if pr.get("title") and pr.get("url") and pr.get("updatedAt"):
-        return pr
-    owner, repo = parse_repo(pr)
-    return fetch_pr_details(owner, repo, pr.get("number", 0), verbose)
-
-
-def fetch_pr_reviews(owner, repo, number, verbose, raise_errors=False):
+def fetch_pr_reviews(owner, repo, number, verbose):
     """Fetch all reviews for a PR."""
     try:
         return run_gh([
@@ -236,12 +155,10 @@ def fetch_pr_reviews(owner, repo, number, verbose, raise_errors=False):
         ], verbose)
     except RuntimeError as e:
         log(f"  Warning: failed to fetch reviews for {owner}/{repo}#{number}: {e}")
-        if raise_errors:
-            raise
         return []
 
 
-def fetch_pr_comments(owner, repo, number, verbose, raise_errors=False):
+def fetch_pr_comments(owner, repo, number, verbose):
     """Fetch all review comments (inline) for a PR."""
     try:
         return run_gh([
@@ -250,8 +167,6 @@ def fetch_pr_comments(owner, repo, number, verbose, raise_errors=False):
         ], verbose)
     except RuntimeError as e:
         log(f"  Warning: failed to fetch comments for {owner}/{repo}#{number}: {e}")
-        if raise_errors:
-            raise
         return []
 
 
@@ -297,41 +212,8 @@ def truncate_diff(diff_hunk, max_lines=20):
     return "\n".join(lines[:max_lines]) + f"\n... ({len(lines) - max_lines} more lines)"
 
 
-def summarize_review_states(reviews):
-    """Return the most significant latest review state from a list of reviews."""
-    if not reviews:
-        return "-"
-    ordered = sorted(reviews, key=lambda r: r.get("submitted_at", ""))
-    verdicts = [r.get("state", "COMMENTED") for r in ordered]
-    significant = [v for v in verdicts if v != "COMMENTED"]
-    return significant[-1] if significant else verdicts[-1]
-
-
-def summarize_verdicts(reviews, usernames):
-    """Summarize review verdicts for one or more target users."""
-    if not reviews:
-        return "-"
-    if len(usernames) == 1:
-        return summarize_review_states(reviews)
-
-    by_login = defaultdict(list)
-    display_names = {}
-    for review in reviews:
-        login = review.get("user", {}).get("login", "unknown")
-        key = login.lower()
-        by_login[key].append(review)
-        display_names.setdefault(key, login)
-
-    parts = []
-    for username in usernames:
-        key = username.lower()
-        if key in by_login:
-            parts.append(f"{display_names.get(key, username)}: {summarize_review_states(by_login[key])}")
-    return "; ".join(parts) if parts else "-"
-
-
-def build_threads(comments, target_logins):
-    """Group comments into threads. Keep threads where a target user participated.
+def build_threads(comments, username):
+    """Group comments into threads. Keep threads where target user participated.
 
     Returns list of threads, each thread is a list of comments sorted chronologically.
     The first comment in each thread is the root (has diff_hunk context).
@@ -360,7 +242,7 @@ def build_threads(comments, target_logins):
         thread_comments.sort(key=lambda c: c.get("created_at", ""))
         # Keep only threads where target user participated.
         user_in_thread = any(
-            is_target_login(c.get("user", {}).get("login", ""), target_logins)
+            c.get("user", {}).get("login", "") == username
             for c in thread_comments
         )
         if user_in_thread:
@@ -371,7 +253,7 @@ def build_threads(comments, target_logins):
     return threads
 
 
-def render_pr_markdown(pr, reviews, threads, usernames, target_logins):
+def render_pr_markdown(pr, reviews, threads, username):
     """Render a single PR's review data as markdown."""
     owner, repo = parse_repo(pr)
     number = pr.get("number", "?")
@@ -385,24 +267,18 @@ def render_pr_markdown(pr, reviews, threads, usernames, target_logins):
     lines.append(f"*State: {state} | Last updated: {updated}*")
     lines.append("")
 
-    multiple_users = len(usernames) > 1
-
-    # Target users' reviews (verdicts).
+    # User's reviews (verdicts).
     user_reviews = [
         r for r in reviews
-        if is_target_login(r.get("user", {}).get("login", ""), target_logins)
+        if r.get("user", {}).get("login", "") == username
         and r.get("state", "") != "PENDING"
     ]
     user_reviews.sort(key=lambda r: r.get("submitted_at", ""))
 
     for r in user_reviews:
-        author = r.get("user", {}).get("login", "unknown")
         state_str = r.get("state", "COMMENTED")
         submitted = format_time(r.get("submitted_at", ""))
-        if multiple_users:
-            lines.append(f"## Review by {author}: {state_str} ({submitted})")
-        else:
-            lines.append(f"## Review: {state_str} ({submitted})")
+        lines.append(f"## Review: {state_str} ({submitted})")
         body = (r.get("body") or "").strip()
         if body:
             lines.append(body)
@@ -457,21 +333,17 @@ def render_pr_markdown(pr, reviews, threads, usernames, target_logins):
 
     # If no reviews and no threads, note it.
     if not user_reviews and not threads:
-        if multiple_users:
-            lines.append("*No review activity found for these users on this PR.*")
-        else:
-            lines.append("*No review activity found for this user on this PR.*")
+        lines.append("*No review activity found for this user on this PR.*")
         lines.append("")
 
     return "\n".join(lines)
 
 
-def render_index(username_label, index_data):
+def render_index(username, index_data):
     """Render the index.md from the full index data structure.
 
     index_data is a dict with:
         "username": str
-        "usernames": [str, ...]
         "runs": [{"org": str, "period_desc": str}, ...]
         "summaries": [summary_dict, ...]   (keyed by relative_path for dedup)
     """
@@ -479,7 +351,7 @@ def render_index(username_label, index_data):
     summaries = index_data.get("summaries", [])
 
     lines = []
-    lines.append(f"# Code Review History: {username_label}")
+    lines.append(f"# Code Review History: {username}")
 
     # Build a combined description from all runs.
     if runs:
@@ -500,152 +372,20 @@ def render_index(username_label, index_data):
     return "\n".join(lines)
 
 
-def parse_index_md(path):
-    """Parse the generated markdown index table into summary dicts."""
-    summaries = []
-    with open(path) as f:
-        for line in f:
-            stripped = line.strip()
-            if not stripped.startswith("| ["):
-                continue
-
-            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
-            if len(cells) != 4:
-                continue
-
-            match = INDEX_TABLE_ROW_RE.search(cells[0])
-            if not match:
-                continue
-
-            repo, number, relative_path = match.groups()
-            summaries.append({
-                "repo": repo,
-                "number": parse_int(number),
-                "verdict": cells[1],
-                "comment_count": parse_int(cells[2]),
-                "updated": cells[3],
-                "relative_path": relative_path,
-            })
-    return summaries
-
-
-def load_index_for_retry(output_dir, username_label, usernames):
-    """Load .index.json, falling back to parsing index.md."""
-    index_json_path = os.path.join(output_dir, ".index.json")
-    if os.path.exists(index_json_path):
-        with open(index_json_path) as f:
-            return json.load(f)
-
-    index_md_path = os.path.join(output_dir, "index.md")
-    if not os.path.exists(index_md_path):
-        raise FileNotFoundError(
-            f"retry mode needs {index_json_path} or {index_md_path}"
-        )
-
-    return {
-        "username": username_label,
-        "usernames": usernames,
-        "runs": [],
-        "summaries": parse_index_md(index_md_path),
-    }
-
-
-def retry_candidate_reason(summary, output_dir):
-    """Return why a summary should be retried, or None when it looks complete."""
-    relative_path = summary.get("relative_path", "")
-    if relative_path:
-        filepath = os.path.join(output_dir, relative_path)
-        if not os.path.exists(filepath):
-            return "missing PR file"
-
-    verdict = str(summary.get("verdict", "")).strip()
-    comment_count = parse_int(summary.get("comment_count"))
-    if verdict == "-" and comment_count == 0:
-        return "empty fetched activity"
-
-    return None
-
-
-def summary_owner_repo_number(summary, default_owner):
-    """Extract owner/repo/PR number from an index summary."""
-    relative_path = summary.get("relative_path", "")
-    owner = default_owner
-    repo = summary.get("repo", "")
-    number = parse_int(summary.get("number"))
-
-    if relative_path:
-        parts = relative_path.split("/")
-        if len(parts) >= 2:
-            owner = parts[0]
-        filename = parts[-1]
-        match = PR_FILENAME_RE.match(filename)
-        if match:
-            repo = repo or match.group("repo")
-            number = number or parse_int(match.group("number"))
-
-    if not owner or not repo or not number:
-        return None
-    return owner, repo, number
-
-
-def retry_prs_from_index(index_data, output_dir, org, verbose):
-    """Build minimal PR records for retry candidates from saved index data."""
-    prs = []
-    seen = set()
-
-    for summary in index_data.get("summaries", []):
-        parsed = summary_owner_repo_number(summary, org)
-        if not parsed:
-            log(f"  Warning: cannot parse retry index entry: {summary}", verbose)
-            continue
-
-        owner, repo, number = parsed
-        if owner.lower() != org.lower():
-            continue
-
-        reason = retry_candidate_reason(summary, output_dir)
-        if not reason:
-            continue
-
-        key = (owner.lower(), repo.lower(), number)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        prs.append({
-            "number": number,
-            "title": "",
-            "url": "",
-            "repository": {"nameWithOwner": f"{owner}/{repo}"},
-            "state": "unknown",
-            "updatedAt": summary.get("updated", ""),
-            "_retry_reason": reason,
-        })
-
-    return prs
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Collect GitHub code review history as markdown."
     )
-    parser.add_argument(
-        "usernames",
-        metavar="username[,username...]",
-        type=parse_usernames,
-        help="GitHub username, or comma-separated usernames, whose reviews to collect",
-    )
+    parser.add_argument("username", help="GitHub username whose reviews to collect")
     parser.add_argument("org", help="GitHub org/owner to scope the search")
     parser.add_argument("-d", "--days", type=int, default=None,
                         help="Lookback period in days (default: 7 when -n not given)")
     parser.add_argument("-n", "--count", type=int, default=None,
-                        help="Max number of PRs to fetch; in --retry mode, max retry candidates (no limit by default)")
+                        help="Max number of PRs to fetch (no limit by default)")
     parser.add_argument("-o", "--output-dir", default="/tmp/gh-reviews",
                         help="Output directory (default: /tmp/gh-reviews)")
     parser.add_argument("-a", "--append", action="store_true",
                         help="Append to existing index (for multi-org collection)")
-    parser.add_argument("--retry", action="store_true",
-                        help="Retry indexed PRs whose PR file is missing or whose index row has no fetched activity")
     parser.add_argument("-j", "--jobs", type=int, default=4,
                         help="Parallel workers for fetching PR data (default: 4)")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -653,37 +393,15 @@ def main():
     args = parser.parse_args()
 
     # Default to 7 days when neither filter is given.
-    if not args.retry and args.days is None and args.count is None:
+    if args.days is None and args.count is None:
         args.days = 7
 
-    username_label = format_usernames(args.usernames)
-    target_logins = target_login_set(args.usernames)
+    check_gh()
 
-    if args.retry:
-        try:
-            index_data = load_index_for_retry(args.output_dir, username_label, args.usernames)
-        except FileNotFoundError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
-
-        prs = retry_prs_from_index(index_data, args.output_dir, args.org, args.verbose)
-        if args.count is not None and len(prs) > args.count:
-            prs = prs[:args.count]
-
-        if not prs:
-            log("No retry candidates found.", True)
-            sys.exit(0)
-
-        log(f"Retrying {len(prs)} indexed PRs in {args.output_dir}...", True)
-        check_gh()
-    else:
-        check_gh()
-
-        since = None
-        if args.days is not None:
-            since = datetime.now(timezone.utc) - timedelta(days=args.days)
-        prs = search_reviewed_prs(args.usernames, args.org, since, args.count, args.verbose)
-        index_data = None
+    since = None
+    if args.days is not None:
+        since = datetime.now(timezone.utc) - timedelta(days=args.days)
+    prs = search_reviewed_prs(args.username, args.org, since, args.count, args.verbose)
 
     if not prs:
         log("No PRs found.", True)
@@ -695,39 +413,35 @@ def main():
     counter_lock = threading.Lock()
 
     def process_pr(pr):
-        retry_reason = pr.get("_retry_reason")
-        if args.retry:
-            pr = ensure_pr_details(pr, args.verbose)
-            if retry_reason:
-                pr["_retry_reason"] = retry_reason
-
         owner, repo = parse_repo(pr)
         number = pr.get("number", 0)
 
         with counter_lock:
             counter[0] += 1
             idx = counter[0]
-        if retry_reason:
-            log(f"[{idx}/{total}] Processing {owner}/{repo}#{number} ({retry_reason})...", args.verbose)
-        else:
-            log(f"[{idx}/{total}] Processing {owner}/{repo}#{number}...", args.verbose)
+        log(f"[{idx}/{total}] Processing {owner}/{repo}#{number}...", args.verbose)
 
-        reviews = fetch_pr_reviews(owner, repo, number, args.verbose, raise_errors=args.retry)
-        comments = fetch_pr_comments(owner, repo, number, args.verbose, raise_errors=args.retry)
-        threads = build_threads(comments, target_logins)
+        reviews = fetch_pr_reviews(owner, repo, number, args.verbose)
+        comments = fetch_pr_comments(owner, repo, number, args.verbose)
+        threads = build_threads(comments, args.username)
 
-        # Determine verdict(s) for target users.
+        # Determine verdict(s) for this user.
         user_reviews = [
             r for r in reviews
-            if is_target_login(r.get("user", {}).get("login", ""), target_logins)
+            if r.get("user", {}).get("login", "") == args.username
             and r.get("state", "") != "PENDING"
         ]
         user_reviews.sort(key=lambda r: r.get("submitted_at", ""))
-        verdict_str = summarize_verdicts(user_reviews, args.usernames)
+        if user_reviews:
+            verdicts = [r.get("state", "COMMENTED") for r in user_reviews]
+            significant = [v for v in verdicts if v != "COMMENTED"]
+            verdict_str = significant[-1] if significant else verdicts[-1]
+        else:
+            verdict_str = "-"
 
         user_comment_count = sum(
             1 for t in threads for c in t
-            if is_target_login(c.get("user", {}).get("login", ""), target_logins)
+            if c.get("user", {}).get("login", "") == args.username
         )
         user_comment_count += sum(
             1 for r in user_reviews if (r.get("body") or "").strip()
@@ -739,7 +453,7 @@ def main():
         filename = f"{repo}-PR{number}.md"
         filepath = os.path.join(org_dir, filename)
 
-        md = render_pr_markdown(pr, reviews, threads, args.usernames, target_logins)
+        md = render_pr_markdown(pr, reviews, threads, args.username)
         with open(filepath, "w") as f:
             f.write(md)
 
@@ -770,29 +484,25 @@ def main():
                 log(f"  Warning: failed to process {owner}/{repo}#{number}: {e}")
     pr_summaries = [s for s in pr_summaries if s is not None]
 
+    # Build period description for this run.
+    parts = []
+    if args.days is not None:
+        parts.append(f"last {args.days} days")
+    if args.count is not None:
+        parts.append(f"limit {args.count} PRs")
+    period_desc = ", ".join(parts) if parts else "all time"
+
+    # Load or create index data.
     index_json_path = os.path.join(args.output_dir, ".index.json")
-    if not args.retry:
-        # Build period description for this run.
-        parts = []
-        if args.days is not None:
-            parts.append(f"last {args.days} days")
-        if args.count is not None:
-            parts.append(f"limit {args.count} PRs")
-        period_desc = ", ".join(parts) if parts else "all time"
+    if args.append and os.path.exists(index_json_path):
+        with open(index_json_path) as f:
+            index_data = json.load(f)
+        log(f"Appending to existing index ({len(index_data.get('summaries', []))} existing PRs)", args.verbose)
+    else:
+        index_data = {"username": args.username, "runs": [], "summaries": []}
 
-        # Load or create index data.
-        if args.append and os.path.exists(index_json_path):
-            with open(index_json_path) as f:
-                index_data = json.load(f)
-            log(f"Appending to existing index ({len(index_data.get('summaries', []))} existing PRs)", args.verbose)
-        else:
-            index_data = {"username": username_label, "usernames": args.usernames, "runs": [], "summaries": []}
-
-        # Add this run's metadata.
-        index_data["runs"].append({"org": args.org, "period_desc": period_desc})
-
-    index_data["username"] = username_label
-    index_data["usernames"] = args.usernames
+    # Add this run's metadata.
+    index_data["runs"].append({"org": args.org, "period_desc": period_desc})
 
     # Merge summaries, dedup by relative_path (newer run wins).
     existing = {s["relative_path"]: s for s in index_data.get("summaries", [])}
@@ -804,15 +514,14 @@ def main():
     with open(index_json_path, "w") as f:
         json.dump(index_data, f, indent=2)
 
-    index_md = render_index(username_label, index_data)
+    index_md = render_index(args.username, index_data)
     index_path = os.path.join(args.output_dir, "index.md")
     with open(index_path, "w") as f:
         f.write(index_md)
 
     log(f"Done. Output: {args.output_dir}", True)
     log(f"  Index: {index_path}", True)
-    action = "refreshed" if args.retry else "written"
-    log(f"  {len(pr_summaries)} PR files {action} ({len(index_data['summaries'])} total in index)", True)
+    log(f"  {len(pr_summaries)} PR files written ({len(index_data['summaries'])} total in index)", True)
 
 
 if __name__ == "__main__":
